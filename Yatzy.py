@@ -4,7 +4,7 @@ import os
 import platform
 import shutil
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ProcessPoolExecutor
 from itertools import product
 from pathlib import Path
@@ -1018,7 +1018,9 @@ def SimulateRounds(
         system_info = platform.uname()
         metadata_path = run_dir / f"{run_basename}_metadata.json"
         chunk_size_info = int(chunk_size) if chunk_size is not None else None
-        finished_at_utc = datetime.utcfromtimestamp(start_time + elapsed_ms / 1000.0).isoformat(timespec="seconds") + "Z"
+        finished_at_utc = datetime.fromtimestamp(
+            start_time + elapsed_ms / 1000.0, tz=timezone.utc
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
         metadata = {
             "run": {
                 "count": int(count),
@@ -1040,7 +1042,9 @@ def SimulateRounds(
                 "run_timestamp_unix": run_start_unix,
             },
             "timing": {
-                "started_at_utc": datetime.utcfromtimestamp(start_time).isoformat(timespec="seconds") + "Z",
+                "started_at_utc": datetime.fromtimestamp(
+                    start_time, tz=timezone.utc
+                ).isoformat(timespec="seconds").replace("+00:00", "Z"),
                 "finished_at_utc": finished_at_utc,
                 "elapsed_ms": elapsed_ms,
                 "elapsed_seconds": elapsed_ms / 1000.0,
