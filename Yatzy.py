@@ -1,4 +1,5 @@
 import os
+import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor
 from itertools import product
@@ -125,6 +126,14 @@ def _reroll_keep_most_common_array(dice_array, rng, encoded_roll=None, out=None)
         rerolls = generator.integers(1, 7, size=5 - keep_count, dtype=np.int8)
         result[keep_count:] = rerolls
     return result
+
+
+def _cleanup_pycache(root_directory):
+    """Remove __pycache__ directories under root_directory."""
+    for dirpath, dirnames, _ in os.walk(root_directory):
+        if "__pycache__" in dirnames:
+            pycache_path = os.path.join(dirpath, "__pycache__")
+            shutil.rmtree(pycache_path, ignore_errors=True)
 
 
 def RerollKeepMostCommon(dice, rng=None):
@@ -804,4 +813,8 @@ def SimulateRounds(count, processes=None, backend="auto"):
 
 
 if __name__ == "__main__":
-    SimulateRounds(100000, processes=os.cpu_count())
+    try:
+        SimulateRounds(1000000, processes=os.cpu_count())
+    finally:
+        script_directory = os.path.dirname(os.path.abspath(__file__))
+        _cleanup_pycache(script_directory)
