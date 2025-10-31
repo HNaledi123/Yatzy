@@ -1,326 +1,312 @@
-import random
-import argparse
+import numpy as np
+import time
+import matplotlib.pyplot as plt
+import pandas as pd
 from collections import Counter
 
+## --- CONFIGURATION ---
+debug = False
 
-def roll_dice(n=5):
-    return [random.randint(1, 6) for _ in range(n)]
+## --- HELPERS ---
 
+def RollDice(count):
+    return np.random.randint(1, 7, count).tolist()
 
-def choose_keep_value(dice):
+def EvaluateUpperSection(dice, target_value):
+    score = 0
+    for n in dice:
+        if n == target_value:
+            score += target_value
+    return score
+
+def EvaluateTwoPairs(dice):
+    score = 0
+    required = 0
     counts = Counter(dice)
-    max_count = max(counts.values())
-    candidates = [v for v, c in counts.items() if c == max_count]
-    return max(candidates)
+    for val, count in counts.items():
+        if count == 2 or count == 3:
+            required += 1
+            score += val * 2
+    if required < 2:
+        score = 0
+    return score
 
-
-def reroll_to_keep_value(dice, keep_value):
-    return [d if d == keep_value else random.randint(1, 6) for d in dice]
-
-
-def score_scandinavian_yatzy(dice):
+def EvaluateNOfAKind(dice, required_count):
+    score = 0
     counts = Counter(dice)
-    scores = {}
+    for val, count in counts.items():
+        if count >= required_count:
+            if required_count == 5:
+                score = 50
+            else:
+                score = max(score, val * required_count)
+    return score
 
-    # Upper section
-    for v in range(1, 7):
-        s = v * counts.get(v, 0)
-        if s > 0:
-            scores[f"{v}s"] = s
+def EvaluateStraight(dice, size):
+    score = 0
+    if sorted(dice) == list(range(1 + size, 6 + size)):
+        score = 15 + size * 5  # small: 15, large: 20
+    return score
 
-    # One Pair (highest pair)
-    pairs = sorted([v for v, c in counts.items() if c >= 2], reverse=True)
-    if pairs:
-        scores["One Pair"] = 2 * pairs[0]
+def EvaluateFullHouse(dice):
+    score = 0
+    has_pair = False
+    has_three = False
+    counts = Counter(dice)
+    for val, count in counts.items():
+        if count == 2:
+            has_pair = True
+            score += val * 2
+        if count == 3:
+            has_three = True
+            score += val * 3
+    if not (has_pair and has_three):
+        score = 0
+    return score
 
-    # Two Pair (two distinct pairs)
-    if len(pairs) >= 2:
-        scores["Two Pair"] = 2 * (pairs[0] + pairs[1])
+def EvaluateChance(dice):
+    return sum(dice)
 
-    # Three of a kind
-    threes = sorted([v for v, c in counts.items() if c >= 3], reverse=True)
-    if threes:
-        scores["Three of a Kind"] = 3 * threes[0]
+def EvaluateBestCategory(dice, allowed):
+    score = -1
+    chosen = ""
 
-    # Four of a kind
-    fours = sorted([v for v, c in counts.items() if c >= 4], reverse=True)
-    if fours:
-        scores["Four of a Kind"] = 4 * fours[0]
+    for face in range(6, 0, -1):
+        evaluation = EvaluateUpperSection(dice, face)
+        if evaluation > score and ("Upper" + str(face)) in allowed:
+            score = evaluation
+            chosen = "Upper" + str(face)
 
-    # Small Straight (1-2-3-4-5)
-    if set(dice) == {1, 2, 3, 4, 5}:
-        scores["Small Straight"] = 15
+    for p in range(5, 1, -1):
+        evaluation = EvaluateNOfAKind(dice, p)
+        if evaluation > score and ("OfAKind" + str(p)) in allowed:
+            score = evaluation
+            chosen = "OfAKind" + str(p)
 
-    # Large Straight (2-3-4-5-6)
-    if set(dice) == {2, 3, 4, 5, 6}:
-        scores["Large Straight"] = 20
+    evaluation = EvaluateTwoPairs(dice)
+    if evaluation > score and "TwoPairs" in allowed:
+        score = evaluation
+        chosen = "TwoPairs"
 
-    # Full House (3 of a kind + a pair, different values), score is sum of all dice
-    has_three = [v for v, c in counts.items() if c >= 3]
-    has_pair = [v for v, c in counts.items() if c >= 2]
-    full_house = False
-    for t in has_three:
-        for p in has_pair:
-            if p != t and counts[t] >= 3 and counts[p] >= 2:
-                full_house = True
-                break
-        if full_house:
-            break
-    if full_house:
-        scores["Full House"] = sum(dice)
+    for s in (1, 0):  # check Large then Small
+        evaluation = EvaluateStraight(dice, s)
+        name = "LargeStraight" if s == 1 else "SmallStraight"
+        if evaluation > score and name in allowed:
+            score = evaluation
+            chosen = name
 
-    # Chance
-    scores["Chance"] = sum(dice)
+    evaluation = EvaluateFullHouse(dice)
+    if evaluation > score and "FullHouse" in allowed:
+        score = evaluation
+        chosen = "FullHouse"
 
-    # Yatzy (five of a kind)
-    if 5 in counts.values():
-        scores["Yatzy"] = 50
+    evaluation = EvaluateChance(dice)
+    if evaluation > score and "Chance" in allowed:
+        score = evaluation
+        chosen = "Chance"
 
-    return scores
+    return score, chosen
 
+def SatisfiedCategories(dice):
+    satisfied = []
 
-def choose_best_category(scores):
-    # Tie-breaker preference (higher is preferred)
-    preference = {
-        "Yatzy": 100,
-        "Four of a Kind": 90,
-        "Full House": 80,
-        "Large Straight": 75,
-        "Small Straight": 70,
-        "Three of a Kind": 60,
-        "Two Pair": 50,
-        "One Pair": 40,
-        "6s": 36,
-        "5s": 35,
-        "4s": 34,
-        "3s": 33,
-        "2s": 32,
-        "1s": 31,
-        "Chance": 10,
-    }
-    return max(scores.items(), key=lambda kv: (kv[1], preference.get(kv[0], 0)))
+    for face in range(6, 0, -1):
+        evaluation = EvaluateUpperSection(dice, face)
+        if evaluation > 0:
+            satisfied.append("Upper" + str(face))
 
+    for p in range(5, 1, -1):
+        evaluation = EvaluateNOfAKind(dice, p)
+        if evaluation > 0:
+            satisfied.append("OfAKind" + str(p))
 
-def simulate_round(seed=None):
-    if seed is not None:
-        random.seed(seed)
+    evaluation = EvaluateTwoPairs(dice)
+    if evaluation > 0:
+        satisfied.append("TwoPairs")
 
-    initial = roll_dice(5)
+    for s in (1, 0):
+        evaluation = EvaluateStraight(dice, s)
+        if evaluation > 0:
+            satisfied.append("LargeStraight" if s == 1 else "SmallStraight")
 
-    # First reroll: keep the most common value (highest value on tie)
-    keep1 = choose_keep_value(initial)
-    after_r1 = reroll_to_keep_value(initial, keep1)
+    evaluation = EvaluateFullHouse(dice)
+    if evaluation > 0:
+        satisfied.append("FullHouse")
 
-    # Second reroll: recalculate keep choice on the new dice
-    keep2 = choose_keep_value(after_r1)
-    final = reroll_to_keep_value(after_r1, keep2)
+    evaluation = EvaluateChance(dice)
+    if evaluation > 0:
+        satisfied.append("Chance")
 
-    scores = score_scandinavian_yatzy(final)
-    best_category, best_score = choose_best_category(scores)
+    return satisfied
 
-    return {
-        "initial": initial,
-        "keep_after_r1": keep1,
-        "after_r1": after_r1,
-        "keep_after_r2": keep2,
-        "final": final,
-        "scores": scores,
-        "best_category": best_category,
-        "best_score": best_score,
-    }
+def EvaluateBonus(points):
+    score = 0
+    if points >= 63:
+        score = 50
+    if debug:
+        print("Bonus | " + str(score))
+    return score
 
+# REROLL STRATEGY:
+# On each roll keep the most frequent value(s), reroll the rest.
 
-def simulate_rounds(n_rounds=1000, seed=None):
-    if seed is not None:
-        random.seed(seed)
+def RerollKeepMostCommon(dice):
+    new_dice = []
+    maxcount = 0
+    maxval = 0
+    counts = Counter(dice)
+    for val, count in counts.items():
+        if count > maxcount or (count == maxcount and val > maxval):
+            maxval = val
+            maxcount = count
+    i = maxcount
+    while i > 0:
+        new_dice.append(int(maxval))
+        i -= 1
+    reroll = RollDice(5 - maxcount)
+    for n in reroll:
+        new_dice.append(n)
+    return new_dice
 
-    category_counts = Counter()
-    scores = []
+## --- MAIN ---
 
-    for _ in range(n_rounds):
-        result = simulate_round()
-        category_counts[result["best_category"]] += 1
-        scores.append(result["best_score"])
+def PlayYatzy():
+    allowed_categories = [
+        "Upper1","Upper2","Upper3","Upper4","Upper5","Upper6",
+        "OfAKind2","OfAKind3","OfAKind4","OfAKind5",
+        "TwoPairs","SmallStraight","LargeStraight","FullHouse","Chance"
+    ]
+    points = 0
+    upper_points = 0
+    round_idx = 1
+    stats = {r: 0 for r in allowed_categories}
+    stats_reroll1 = stats.copy()
+    stats_reroll2 = stats.copy()
+    while round_idx < 16:
+        dice = RollDice(5)
+        dice_r1 = RerollKeepMostCommon(dice)
+        dice_r2 = RerollKeepMostCommon(dice_r1)
+        evaluation = EvaluateBestCategory(dice_r2, allowed_categories)
+        req_eval0 = SatisfiedCategories(dice)
+        req_eval1 = SatisfiedCategories(dice_r1)
+        req_eval2 = SatisfiedCategories(dice_r2)
+        if debug:
+            print("Satisfied 0 (Round " + str(round_idx) + ") | " + str(req_eval0))
+            print("Satisfied 1 (Round " + str(round_idx) + ") | " + str(req_eval1))
+            print("Satisfied 2 (Round " + str(round_idx) + ") | " + str(req_eval2))
+            print("Round " + str(round_idx) + " | " + evaluation[1] + " | " + str(evaluation[0]))
+        for k, s in stats.items():
+            if k in req_eval0:
+                s += 1
+                stats.update({k: s})
+        for k, s in stats_reroll1.items():
+            if k in req_eval1:
+                s += 1
+                stats_reroll1.update({k: s})
+        for k, s in stats_reroll2.items():
+            if k in req_eval2:
+                s += 1
+                stats_reroll2.update({k: s})
 
-    total = sum(scores)
-    avg = total / n_rounds if n_rounds else 0.0
+        points += evaluation[0]
+        allowed_categories.remove(evaluation[1])
+        if "Upper" in evaluation[1]:
+            upper_points += evaluation[0]
+        round_idx += 1
+    bonus = EvaluateBonus(upper_points)
+    points += bonus
+    return points, bonus > 0, stats, stats_reroll1, stats_reroll2
 
-    return {
-        "rounds": n_rounds,
-        "avg_score": avg,
-        "min_score": min(scores) if scores else 0,
-        "max_score": max(scores) if scores else 0,
-        "category_counts": dict(category_counts),
-    }
+def SimulateRounds(count):
+    categories = [
+        "Upper1","Upper2","Upper3","Upper4","Upper5","Upper6",
+        "OfAKind2","OfAKind3","OfAKind4","OfAKind5",
+        "TwoPairs","SmallStraight","LargeStraight","FullHouse","Chance"
+    ]
+    start = time.time()
+    results = []
+    bonus_hits = 0
+    agg_stats0 = {r: 0 for r in categories}
+    agg_stats1 = agg_stats0.copy()
+    agg_stats2 = agg_stats0.copy()
+    for _ in range(count):
+        pts, got_bonus, stats0, s1, s2 = PlayYatzy()
+        results.append(pts)
+        if got_bonus:
+            bonus_hits += 1
+        for r, v in stats0.items():
+            agg_stats0.update({r: agg_stats0[r] + v})
+        for r, v in s1.items():
+            agg_stats1.update({r: agg_stats1[r] + v})
+        for r, v in s2.items():
+            agg_stats2.update({r: agg_stats2[r] + v})
 
+    end = time.time()
+    time_ms = (end - start) * 1000
+    
+    # Statistics
+    mean_val = np.mean(results)
+    std_val = np.std(results)
+    bonus_probability = bonus_hits / count * 100
 
-ALL_CATEGORIES = [
-    "1s",
-    "2s",
-    "3s",
-    "4s",
-    "5s",
-    "6s",
-    "One Pair",
-    "Two Pair",
-    "Three of a Kind",
-    "Four of a Kind",
-    "Small Straight",
-    "Large Straight",
-    "Full House",
-    "Chance",
-    "Yatzy",
-]
+    # Output
+    print(f"\n--- RESULTS ({count} games) ---")
+    print(f"\nTime: {time_ms}ms")
 
-# Theoretical maximum scores per category (used for choosing where to put 0)
-MAX_POSSIBLE = {
-    "1s": 5,
-    "2s": 10,
-    "3s": 15,
-    "4s": 20,
-    "5s": 25,
-    "6s": 30,
-    "One Pair": 12,          # 6+6
-    "Two Pair": 22,          # 6+6 + 5+5
-    "Three of a Kind": 18,   # 6*3
-    "Four of a Kind": 24,    # 6*4
-    "Small Straight": 15,    # 1+2+3+4+5
-    "Large Straight": 20,    # 2+3+4+5+6
-    "Full House": 28,        # 6+6+6 + 5+5
-    "Chance": 30,            # 6+6+6+6+6 is 30? actually five sixes = 30
-    "Yatzy": 50,
-}
+    # --- CSV EXPORT + PLOTTING ---
 
+    df = pd.DataFrame({
+        "Category": categories,
+        "Roll0_count": [agg_stats0[r] for r in categories],
+        "Roll1_count": [agg_stats1[r] for r in categories],
+        "Roll2_count": [agg_stats2[r] for r in categories],
+    })
 
-def choose_category_for_game(final_dice, available_categories):
-    # Compute fulfilled (positive) scores for available categories
-    all_positive = score_scandinavian_yatzy(final_dice)
-    candidates = {k: v for k, v in all_positive.items() if k in available_categories}
+    df["Roll0_%"] = df["Roll0_count"] / count / 15 * 100
+    df["Roll1_%"] = df["Roll1_count"] / count / 15 * 100
+    df["Roll2_%"] = df["Roll2_count"] / count / 15 * 100
 
-    if candidates:
-        # Choose highest score; tie-break using same preference as before
-        best_cat, best_score = choose_best_category(candidates)
-        return best_cat, best_score
+    # Append summary rows
+    summary = pd.DataFrame([
+        {"Category": "AverageScore", "Roll0_count": mean_val},
+        {"Category": "Std", "Roll0_count": std_val},
+        {"Category": "Bonus%", "Roll0_count": bonus_probability}
+    ])
+    df = pd.concat([df, summary], ignore_index=True)
 
-    # No available category yields a positive score; pick a category to assign 0
-    # Strategy: sacrifice the category with the lowest theoretical maximum; tie-break by name
-    zero_cat = min(available_categories, key=lambda c: (MAX_POSSIBLE.get(c, 0), c))
-    return zero_cat, 0
+    csv_name = f"yatzy_stats_{count}_{time.time()}.csv"
+    df.to_csv(csv_name, index=False)
+    print(f"Exported results to: {csv_name}")
 
+    # Plot evolution of probabilities per category (BAR CHART)
+    plt.figure(figsize=(10, 5))
 
-def simulate_game(seed=None):
-    if seed is not None:
-        random.seed(seed)
+    categories_no_summary = df["Category"][:-3]
+    x = np.arange(len(categories_no_summary))
+    width = 0.25  # bar width
 
-    remaining = set(ALL_CATEGORIES)
-    assigned = {}
-    rounds = []
+    plt.bar(x - width, df["Roll0_%"][:-3], width, label="First roll")
+    plt.bar(x, df["Roll1_%"][:-3], width, label="Reroll 1")
+    plt.bar(x + width, df["Roll2_%"][:-3], width, label="Reroll 2")
 
-    while remaining:
-        # Play one round (roll + 2 rerolls using the simple strategy)
-        initial = roll_dice(5)
-        keep1 = choose_keep_value(initial)
-        after_r1 = reroll_to_keep_value(initial, keep1)
-        keep2 = choose_keep_value(after_r1)
-        final = reroll_to_keep_value(after_r1, keep2)
+    plt.title("Probability to satisfy category (initial roll to second reroll)")
+    plt.xlabel("Yatzy category")
+    plt.ylabel("Probability (%)")
+    plt.xticks(x, categories_no_summary, rotation=45)
+    plt.legend()
+    plt.grid(alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.show()
 
-        chosen_cat, score = choose_category_for_game(final, remaining)
+    plt.figure(figsize=(8, 4))
+    plt.hist(results, bins=20, edgecolor='black', alpha=0.7)
+    plt.axvline(mean_val, color='red', linestyle='--', linewidth=2, label=f"Mean = {mean_val:.1f}")
+    plt.title(f"Distribution of Yatzy scores ({count} simulations)")
+    plt.xlabel("Points")
+    plt.ylabel("Games")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
-        assigned[chosen_cat] = score
-        remaining.remove(chosen_cat)
-
-        rounds.append({
-            "initial": initial,
-            "after_r1": after_r1,
-            "final": final,
-            "chosen_category": chosen_cat,
-            "score": score,
-        })
-
-    total_score = sum(assigned.values())
-
-    return {
-        "rounds_played": len(rounds),
-        "total_score": total_score,
-        "per_category": assigned,
-        "rounds": rounds,
-    }
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Simulate Scandinavian Yatzy rounds")
-    parser.add_argument("--rounds", type=int, default=1, help="Number of rounds to simulate")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
-    parser.add_argument("--game", action="store_true", help="Simulate a full game (use each category once)")
-    parser.add_argument("--games", type=int, default=0, help="Simulate N full games and summarize results")
-    args = parser.parse_args()
-
-    def simulate_games(n_games=100, seed=None):
-        if seed is not None:
-            random.seed(seed)
-
-        totals = []
-        category_sums = {cat: 0 for cat in ALL_CATEGORIES}
-        category_zero_counts = {cat: 0 for cat in ALL_CATEGORIES}
-
-        for _ in range(n_games):
-            game = simulate_game(seed=None)
-            totals.append(game["total_score"])
-            for cat, score in game["per_category"].items():
-                category_sums[cat] += score
-                if score == 0:
-                    category_zero_counts[cat] += 1
-
-        avg_total = sum(totals) / n_games if n_games else 0.0
-
-        per_category_avg = {cat: category_sums[cat] / n_games for cat in ALL_CATEGORIES}
-        per_category_zero_rate = {cat: category_zero_counts[cat] / n_games for cat in ALL_CATEGORIES}
-
-        return {
-            "games": n_games,
-            "avg_total": avg_total,
-            "min_total": min(totals) if totals else 0,
-            "max_total": max(totals) if totals else 0,
-            "per_category_avg": per_category_avg,
-            "per_category_zero_rate": per_category_zero_rate,
-        }
-
-    if args.games and args.games > 0:
-        gsum = simulate_games(n_games=args.games, seed=args.seed)
-        print(f"Simulated games:   {gsum['games']}")
-        print(f"Average total:     {gsum['avg_total']:.3f}")
-        print(f"Min total:         {gsum['min_total']}")
-        print(f"Max total:         {gsum['max_total']}")
-        print("Average per-category (zeros %):")
-        for cat in ALL_CATEGORIES:
-            avg = gsum["per_category_avg"][cat]
-            zr = gsum["per_category_zero_rate"][cat] * 100
-            print(f"  - {cat}: {avg:.3f} ({zr:.1f}% zeros)")
-    elif args.game:
-        game = simulate_game(seed=args.seed)
-        print(f"Game total score:  {game['total_score']}")
-        print("Category scores:")
-        for cat in ALL_CATEGORIES:
-            print(f"  - {cat}: {game['per_category'][cat]}")
-    elif args.rounds <= 1:
-        result = simulate_round(seed=args.seed)
-        print(f"Initial roll:      {result['initial']}")
-        print(f"Keep value (r1):   {result['keep_after_r1']}")
-        print(f"After reroll 1:    {result['after_r1']}")
-        print(f"Keep value (r2):   {result['keep_after_r2']}")
-        print(f"Final roll:        {result['final']}")
-        fulfilled = {k: v for k, v in result["scores"].items() if v > 0}
-        print("Fulfilled categories and scores:")
-        for k in sorted(fulfilled, key=lambda x: (-fulfilled[x], x)):
-            print(f"  - {k}: {fulfilled[k]}")
-        print(f"Chosen category:   {result['best_category']} ({result['best_score']})")
-    else:
-        summary = simulate_rounds(n_rounds=args.rounds, seed=args.seed)
-        print(f"Simulated rounds:  {summary['rounds']}")
-        print(f"Average score:     {summary['avg_score']:.3f}")
-        print(f"Min score:         {summary['min_score']}")
-        print(f"Max score:         {summary['max_score']}")
-        print("Category selection counts:")
-        for cat, cnt in sorted(summary["category_counts"].items(), key=lambda kv: (-kv[1], kv[0])):
-            rate = cnt / summary["rounds"]
-            print(f"  - {cat}: {cnt} ({rate:.2%})")
+SimulateRounds(10000)
