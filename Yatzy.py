@@ -7,6 +7,38 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+try:
+    from numba import njit, prange, get_num_threads
+    from numba import int32 as nb_int32, int8 as nb_int8, boolean as nb_boolean
+    NUMBA_AVAILABLE = True
+except Exception:  # NumPy/Numba incompatibility or missing package
+    NUMBA_AVAILABLE = False
+    njit = None  # type: ignore
+    prange = range  # type: ignore
+
+    def get_num_threads():
+        return 1
+
+    nb_int32 = int  # type: ignore
+    nb_int8 = int  # type: ignore
+    nb_boolean = bool  # type: ignore
+
+if NUMBA_AVAILABLE:
+    try:
+        from numba import cuda
+        from numba.cuda.random import create_xoroshiro128p_states, xoroshiro128p_uniform_float32
+        CUDA_AVAILABLE = cuda.is_available()
+    except Exception:  # CUDA toolchain missing or driver unavailable
+        cuda = None  # type: ignore
+        create_xoroshiro128p_states = None  # type: ignore
+        xoroshiro128p_uniform_float32 = None  # type: ignore
+        CUDA_AVAILABLE = False
+else:
+    CUDA_AVAILABLE = False
+    cuda = None  # type: ignore
+    create_xoroshiro128p_states = None  # type: ignore
+    xoroshiro128p_uniform_float32 = None  # type: ignore
+
 ## --- CONFIGURATION ---
 debug = False
 
@@ -39,7 +71,7 @@ NUM_CATEGORIES = len(CATEGORY_NAMES)
 NUM_ROUNDS = NUM_CATEGORIES
 
 ROLL_STATE_COUNT = 6 ** 5
-CATEGORY_PRIORITY = (
+CATEGORY_PRIORITY = np.array([
     FACE_TO_UPPER_INDEX[6],
     FACE_TO_UPPER_INDEX[5],
     FACE_TO_UPPER_INDEX[4],
@@ -55,7 +87,7 @@ CATEGORY_PRIORITY = (
     CATEGORY_INDEX["SmallStraight"],
     CATEGORY_INDEX["FullHouse"],
     CATEGORY_INDEX["Chance"],
-)
+], dtype=np.int8)
 
 
 ## --- HELPERS ---
@@ -74,18 +106,25 @@ def _encode_roll(dice_array):
     return key
 
 
-def _reroll_keep_most_common_array(dice_array, rng, encoded_roll=None):
+def _reroll_keep_most_common_array(dice_array, rng, encoded_roll=None, out=None):
     roll_index = _encode_roll(dice_array) if encoded_roll is None else encoded_roll
     keep_count = int(ROLL_KEEP_COUNT[roll_index])
-    if keep_count == 5:
-        return dice_array.copy()
 
-    generator = rng if rng is not None else np.random.default_rng()
+    if keep_count == 5:
+        if out is None:
+            return dice_array.copy()
+        np.copyto(out, dice_array)
+        return out
+
+    result = np.empty(5, dtype=np.int8) if out is None else out
     keep_value = int(ROLL_KEEP_VALUE[roll_index])
-    rerolled = np.empty(5, dtype=np.int8)
-    rerolled[:keep_count] = keep_value
-    rerolled[keep_count:] = generator.integers(1, 7, size=5 - keep_count, dtype=np.int8)
-    return rerolled
+    if keep_count:
+        result[:keep_count] = keep_value
+    if keep_count < 5:
+        generator = rng if rng is not None else np.random.default_rng()
+        rerolls = generator.integers(1, 7, size=5 - keep_count, dtype=np.int8)
+        result[keep_count:] = rerolls
+    return result
 
 
 def RerollKeepMostCommon(dice, rng=None):
@@ -258,11 +297,220 @@ def _evaluate_best_category(dice_array, counts, sorted_dice, dice_sum, allowed_m
     return _evaluate_best_category_from_index(roll_index, allowed_mask)
 
 
+if NUMBA_AVAILABLE:
+    CATEGORY_PRIORITY_NUMBA = CATEGORY_PRIORITY.astype(np.int16)
+
+    @njit(cache=True)
+    def _encode_roll_numba(dice_array):
+        key = 0
+        for value in dice_array:
+            key = key * 6 + (int(value) - 1)
+        return key
+
+    @njit(cache=True)
+    def _reroll_keep_most_common_array_numba(dice_array, roll_index, out):
+        keep_count = int(ROLL_KEEP_COUNT[roll_index])
+        if keep_count == 5:
+            for i in range(5):
+                out[i] = dice_array[i]
+            return
+
+        keep_value = int(ROLL_KEEP_VALUE[roll_index])
+        for i in range(keep_count):
+            out[i] = keep_value
+        for i in range(keep_count, 5):
+            out[i] = np.int8(np.random.randint(1, 7))
+
+    @njit(cache=True)
+    def _evaluate_best_category_from_index_numba(roll_index, allowed_mask):
+        scores = ROLL_SCORE_TABLE[roll_index]
+        best_score = -1
+        best_idx = -1
+        for j in range(CATEGORY_PRIORITY_NUMBA.shape[0]):
+            idx = int(CATEGORY_PRIORITY_NUMBA[j])
+            if not allowed_mask[idx]:
+                continue
+            score = int(scores[idx])
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        return best_score, best_idx
+
+    @njit(cache=True)
+    def _play_yatzy_numba(stats0, stats1, stats2, allowed_mask, dice0, dice1, dice2):
+        for c in range(NUM_CATEGORIES):
+            stats0[c] = 0
+            stats1[c] = 0
+            stats2[c] = 0
+            allowed_mask[c] = True
+
+        total_points = 0
+        upper_points = 0
+
+        for _ in range(NUM_ROUNDS):
+            for j in range(5):
+                dice0[j] = np.int8(np.random.randint(1, 7))
+            idx0 = _encode_roll_numba(dice0)
+            row0 = ROLL_SAT_MATRIX[idx0]
+            for c in range(NUM_CATEGORIES):
+                stats0[c] += int(row0[c])
+
+            _reroll_keep_most_common_array_numba(dice0, idx0, dice1)
+            idx1 = _encode_roll_numba(dice1)
+            row1 = ROLL_SAT_MATRIX[idx1]
+            for c in range(NUM_CATEGORIES):
+                stats1[c] += int(row1[c])
+
+            _reroll_keep_most_common_array_numba(dice1, idx1, dice2)
+            idx2 = _encode_roll_numba(dice2)
+            row2 = ROLL_SAT_MATRIX[idx2]
+            for c in range(NUM_CATEGORIES):
+                stats2[c] += int(row2[c])
+
+            score, chosen_idx = _evaluate_best_category_from_index_numba(idx2, allowed_mask)
+            total_points += score
+            if chosen_idx < 6:
+                upper_points += score
+            allowed_mask[chosen_idx] = False
+
+        bonus = 50 if upper_points >= 63 else 0
+        total_points += bonus
+        return total_points, bonus > 0
+
+    @njit(parallel=True, cache=True)
+    def _simulate_chunk_numba(count, seed):
+        np.random.seed(seed)
+        results = np.empty(count, dtype=np.int32)
+        bonus_hits = np.empty(count, dtype=np.int8)
+        stats0_all = np.empty((count, NUM_CATEGORIES), dtype=np.int32)
+        stats1_all = np.empty((count, NUM_CATEGORIES), dtype=np.int32)
+        stats2_all = np.empty((count, NUM_CATEGORIES), dtype=np.int32)
+
+        for i in prange(count):
+            stats0_local = np.empty(NUM_CATEGORIES, dtype=np.int32)
+            stats1_local = np.empty(NUM_CATEGORIES, dtype=np.int32)
+            stats2_local = np.empty(NUM_CATEGORIES, dtype=np.int32)
+            allowed_mask_local = np.empty(NUM_CATEGORIES, dtype=np.bool_)
+            dice0 = np.empty(5, dtype=np.int8)
+            dice1 = np.empty(5, dtype=np.int8)
+            dice2 = np.empty(5, dtype=np.int8)
+
+            total_points, got_bonus = _play_yatzy_numba(
+                stats0_local, stats1_local, stats2_local, allowed_mask_local, dice0, dice1, dice2
+            )
+            results[i] = total_points
+            bonus_hits[i] = np.int8(1 if got_bonus else 0)
+
+            for c in range(NUM_CATEGORIES):
+                stats0_all[i, c] = stats0_local[c]
+                stats1_all[i, c] = stats1_local[c]
+                stats2_all[i, c] = stats2_local[c]
+
+        return results, bonus_hits, stats0_all, stats1_all, stats2_all
+
+
+if CUDA_AVAILABLE:
+    CATEGORY_PRIORITY_CUDA = CATEGORY_PRIORITY.astype(np.int16)
+
+    @cuda.jit(device=True)
+    def _encode_roll_cuda(dice_array):
+        key = 0
+        for i in range(5):
+            key = key * 6 + (int(dice_array[i]) - 1)
+        return key
+
+    @cuda.jit(device=True)
+    def _roll_die_cuda(rng_states, thread_id):
+        val = int(xoroshiro128p_uniform_float32(rng_states, thread_id) * 6.0)
+        if val >= 6:
+            val = 5
+        return val + 1
+
+    @cuda.jit
+    def _simulate_kernel_cuda(rng_states, results, bonus_hits, stats0_all, stats1_all, stats2_all,
+                              roll_score_table, roll_sat_matrix, roll_keep_value, roll_keep_count, category_priority):
+        idx = cuda.grid(1)
+        if idx >= results.shape[0]:
+            return
+
+        stats0_local = cuda.local.array(NUM_CATEGORIES, nb_int32)
+        stats1_local = cuda.local.array(NUM_CATEGORIES, nb_int32)
+        stats2_local = cuda.local.array(NUM_CATEGORIES, nb_int32)
+        allowed_mask_local = cuda.local.array(NUM_CATEGORIES, nb_boolean)
+        dice0 = cuda.local.array(5, nb_int8)
+        dice1 = cuda.local.array(5, nb_int8)
+        dice2 = cuda.local.array(5, nb_int8)
+
+        for c in range(NUM_CATEGORIES):
+            stats0_local[c] = 0
+            stats1_local[c] = 0
+            stats2_local[c] = 0
+            allowed_mask_local[c] = True
+
+        total_points = 0
+        upper_points = 0
+
+        for _ in range(NUM_ROUNDS):
+            for j in range(5):
+                dice0[j] = _roll_die_cuda(rng_states, idx)
+            idx0 = _encode_roll_cuda(dice0)
+            row0 = roll_sat_matrix[idx0]
+            for c in range(NUM_CATEGORIES):
+                stats0_local[c] += int(row0[c])
+
+            keep_count0 = int(roll_keep_count[idx0])
+            keep_value0 = int(roll_keep_value[idx0])
+            for j in range(keep_count0):
+                dice1[j] = keep_value0
+            for j in range(keep_count0, 5):
+                dice1[j] = _roll_die_cuda(rng_states, idx)
+            idx1 = _encode_roll_cuda(dice1)
+            row1 = roll_sat_matrix[idx1]
+            for c in range(NUM_CATEGORIES):
+                stats1_local[c] += int(row1[c])
+
+            keep_count1 = int(roll_keep_count[idx1])
+            keep_value1 = int(roll_keep_value[idx1])
+            for j in range(keep_count1):
+                dice2[j] = keep_value1
+            for j in range(keep_count1, 5):
+                dice2[j] = _roll_die_cuda(rng_states, idx)
+            idx2 = _encode_roll_cuda(dice2)
+            row2 = roll_sat_matrix[idx2]
+            for c in range(NUM_CATEGORIES):
+                stats2_local[c] += int(row2[c])
+
+            best_score = -1
+            best_idx = 0
+            for j in range(NUM_CATEGORIES):
+                cat_idx = int(category_priority[j])
+                if not allowed_mask_local[cat_idx]:
+                    continue
+                score = int(roll_score_table[idx2, cat_idx])
+                if score > best_score:
+                    best_score = score
+                    best_idx = cat_idx
+
+            total_points += best_score
+            if best_idx < 6:
+                upper_points += best_score
+            allowed_mask_local[best_idx] = False
+
+        bonus = 50 if upper_points >= 63 else 0
+        total_points += bonus
+
+        results[idx] = total_points
+        bonus_hits[idx] = 1 if bonus > 0 else 0
+        for c in range(NUM_CATEGORIES):
+            stats0_all[idx, c] = stats0_local[c]
+            stats1_all[idx, c] = stats1_local[c]
+            stats2_all[idx, c] = stats2_local[c]
+
+
 ## --- MAIN GAMEPLAY ---
 
-def PlayYatzy(rng=None, stats0=None, stats1=None, stats2=None):
+def PlayYatzy(rng=None, stats0=None, stats1=None, stats2=None, allowed_mask=None):
     generator = rng if rng is not None else np.random.default_rng()
-    allowed_mask = np.ones(NUM_CATEGORIES, dtype=bool)
 
     if stats0 is None:
         stats0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
@@ -277,21 +525,33 @@ def PlayYatzy(rng=None, stats0=None, stats1=None, stats2=None):
     else:
         stats2.fill(0)
 
+    if allowed_mask is None:
+        allowed_mask = np.ones(NUM_CATEGORIES, dtype=bool)
+    else:
+        allowed_mask.fill(True)
+
+    roll_sat_matrix = ROLL_SAT_MATRIX
+    roll_sat_lists = ROLL_SAT_LISTS
+
+    dice0 = np.empty(5, dtype=np.int8)
+    dice1 = np.empty(5, dtype=np.int8)
+    dice2 = np.empty(5, dtype=np.int8)
+
     total_points = 0
     upper_points = 0
 
-    for round_idx in range(1, NUM_ROUNDS + 1):
-        dice0 = RollDice(5, generator)
+    for round_idx in range(NUM_ROUNDS):
+        dice0[:] = generator.integers(1, 7, size=5, dtype=np.int8)
         idx0 = _encode_roll(dice0)
-        stats0 += ROLL_SAT_MATRIX[idx0]
+        stats0 += roll_sat_matrix[idx0]
 
-        dice1 = _reroll_keep_most_common_array(dice0, generator, idx0)
+        _reroll_keep_most_common_array(dice0, generator, idx0, out=dice1)
         idx1 = _encode_roll(dice1)
-        stats1 += ROLL_SAT_MATRIX[idx1]
+        stats1 += roll_sat_matrix[idx1]
 
-        dice2 = _reroll_keep_most_common_array(dice1, generator, idx1)
+        _reroll_keep_most_common_array(dice1, generator, idx1, out=dice2)
         idx2 = _encode_roll(dice2)
-        stats2 += ROLL_SAT_MATRIX[idx2]
+        stats2 += roll_sat_matrix[idx2]
 
         score, chosen_idx = _evaluate_best_category_from_index(idx2, allowed_mask)
         total_points += score
@@ -300,18 +560,19 @@ def PlayYatzy(rng=None, stats0=None, stats1=None, stats2=None):
         allowed_mask[chosen_idx] = False
 
         if debug:
-            satisfied0 = [CATEGORY_NAMES[i] for i in ROLL_SAT_LISTS[idx0]]
-            satisfied1 = [CATEGORY_NAMES[i] for i in ROLL_SAT_LISTS[idx1]]
-            satisfied2 = [CATEGORY_NAMES[i] for i in ROLL_SAT_LISTS[idx2]]
-            print(f"Satisfied 0 (Round {round_idx}) | {satisfied0}")
-            print(f"Satisfied 1 (Round {round_idx}) | {satisfied1}")
-            print(f"Satisfied 2 (Round {round_idx}) | {satisfied2}")
-            print(f"Round {round_idx} | {CATEGORY_NAMES[chosen_idx]} | {score}")
+            round_no = round_idx + 1
+            satisfied0 = [CATEGORY_NAMES[i] for i in roll_sat_lists[idx0]]
+            satisfied1 = [CATEGORY_NAMES[i] for i in roll_sat_lists[idx1]]
+            satisfied2 = [CATEGORY_NAMES[i] for i in roll_sat_lists[idx2]]
+            print(f"Satisfied 0 (Round {round_no}) | {satisfied0}")
+            print(f"Satisfied 1 (Round {round_no}) | {satisfied1}")
+            print(f"Satisfied 2 (Round {round_no}) | {satisfied2}")
+            print(f"Round {round_no} | {CATEGORY_NAMES[chosen_idx]} | {score}")
 
     bonus = EvaluateBonus(upper_points)
     total_points += bonus
 
-    return total_points, bonus > 0, stats0, stats1, stats2
+    return total_points, bonus > 0
 
 
 def _simulate_chunk(task):
@@ -326,23 +587,21 @@ def _simulate_chunk(task):
     tmp_stats0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     tmp_stats1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     tmp_stats2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    allowed_mask = np.empty(NUM_CATEGORIES, dtype=bool)
 
     for i in range(count):
-        points, got_bonus, s0, s1, s2 = PlayYatzy(rng, tmp_stats0, tmp_stats1, tmp_stats2)
+        points, got_bonus = PlayYatzy(rng, tmp_stats0, tmp_stats1, tmp_stats2, allowed_mask)
         results[i] = points
         if got_bonus:
             bonus_hits += 1
-        agg_stats0 += s0
-        agg_stats1 += s1
-        agg_stats2 += s2
+        agg_stats0 += tmp_stats0
+        agg_stats1 += tmp_stats1
+        agg_stats2 += tmp_stats2
 
     return results, bonus_hits, agg_stats0, agg_stats1, agg_stats2
 
 
-def SimulateRounds(count, processes=None):
-    if count <= 0:
-        raise ValueError("count must be a positive integer")
-
+def _simulate_python_backend(count, processes):
     available_cpus = os.cpu_count() or 1
     if processes is None:
         processes = min(available_cpus, count)
@@ -365,24 +624,131 @@ def SimulateRounds(count, processes=None):
             chunk_results = list(pool.map(_simulate_chunk, tasks))
     elapsed_ms = (time.time() - start) * 1000
 
-    results_arrays = [chunk[0] for chunk in chunk_results]
-    results = results_arrays[0] if len(results_arrays) == 1 else np.concatenate(results_arrays)
-
-    bonus_hits = sum(chunk[1] for chunk in chunk_results)
-
     agg_stats0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     agg_stats1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     agg_stats2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    for _, _, s0, s1, s2 in chunk_results:
+    results = np.empty(count, dtype=np.int32)
+    bonus_hits = 0
+    offset = 0
+    for (scores, chunk_bonus, s0, s1, s2), size in zip(chunk_results, chunk_sizes):
+        end = offset + size
+        results[offset:end] = scores
+        offset = end
+        bonus_hits += chunk_bonus
         agg_stats0 += s0
         agg_stats1 += s1
         agg_stats2 += s2
+
+    return results, bonus_hits, agg_stats0, agg_stats1, agg_stats2, elapsed_ms, processes
+
+
+def _simulate_numba_backend(count):
+    if not NUMBA_AVAILABLE:
+        raise RuntimeError("Numba backend requested but numba is not available.")
+
+    seed_sequence = np.random.SeedSequence()
+    seed = int(seed_sequence.generate_state(1)[0])
+
+    start = time.time()
+    results, bonus_hits_array, stats0_all, stats1_all, stats2_all = _simulate_chunk_numba(count, seed)
+    elapsed_ms = (time.time() - start) * 1000
+
+    agg_stats0 = stats0_all.sum(axis=0, dtype=np.int64)
+    agg_stats1 = stats1_all.sum(axis=0, dtype=np.int64)
+    agg_stats2 = stats2_all.sum(axis=0, dtype=np.int64)
+    bonus_hits = int(bonus_hits_array.sum())
+
+    return results, bonus_hits, agg_stats0, agg_stats1, agg_stats2, elapsed_ms, get_num_threads()
+
+
+def _simulate_cuda_backend(count, threads_per_block=128):
+    if not CUDA_AVAILABLE:
+        raise RuntimeError("CUDA backend requested but CUDA is not available.")
+
+    if threads_per_block <= 0:
+        raise ValueError("threads_per_block must be a positive integer")
+
+    blocks_per_grid = (count + threads_per_block - 1) // threads_per_block
+    total_threads = blocks_per_grid * threads_per_block
+
+    roll_score_table_dev = cuda.to_device(ROLL_SCORE_TABLE.astype(np.int16))
+    roll_sat_matrix_dev = cuda.to_device(ROLL_SAT_MATRIX.astype(np.uint8))
+    roll_keep_value_dev = cuda.to_device(ROLL_KEEP_VALUE.astype(np.int8))
+    roll_keep_count_dev = cuda.to_device(ROLL_KEEP_COUNT.astype(np.uint8))
+    category_priority_dev = cuda.to_device(CATEGORY_PRIORITY_CUDA)
+
+    results_dev = cuda.device_array(count, dtype=np.int32)
+    bonus_hits_dev = cuda.device_array(count, dtype=np.uint8)
+    stats0_dev = cuda.device_array((count, NUM_CATEGORIES), dtype=np.int32)
+    stats1_dev = cuda.device_array((count, NUM_CATEGORIES), dtype=np.int32)
+    stats2_dev = cuda.device_array((count, NUM_CATEGORIES), dtype=np.int32)
+
+    seed_sequence = np.random.SeedSequence()
+    seed = int(seed_sequence.generate_state(1)[0])
+    rng_states = create_xoroshiro128p_states(total_threads, seed=seed)
+
+    start = time.time()
+    _simulate_kernel_cuda[blocks_per_grid, threads_per_block](
+        rng_states,
+        results_dev,
+        bonus_hits_dev,
+        stats0_dev,
+        stats1_dev,
+        stats2_dev,
+        roll_score_table_dev,
+        roll_sat_matrix_dev,
+        roll_keep_value_dev,
+        roll_keep_count_dev,
+        category_priority_dev,
+    )
+    cuda.synchronize()
+    elapsed_ms = (time.time() - start) * 1000
+
+    results = results_dev.copy_to_host()
+    bonus_hits_array = bonus_hits_dev.copy_to_host()
+    stats0_all = stats0_dev.copy_to_host()
+    stats1_all = stats1_dev.copy_to_host()
+    stats2_all = stats2_dev.copy_to_host()
+
+    agg_stats0 = stats0_all.sum(axis=0, dtype=np.int64)
+    agg_stats1 = stats1_all.sum(axis=0, dtype=np.int64)
+    agg_stats2 = stats2_all.sum(axis=0, dtype=np.int64)
+    bonus_hits = int(bonus_hits_array.sum())
+
+    return results, bonus_hits, agg_stats0, agg_stats1, agg_stats2, elapsed_ms, total_threads
+
+
+def SimulateRounds(count, processes=None, backend="auto"):
+    if count <= 0:
+        raise ValueError("count must be a positive integer")
+
+    backend_normalized = backend.lower()
+    if backend_normalized not in {"auto", "python", "numba", "cuda"}:
+        raise ValueError("backend must be one of 'auto', 'python', 'numba', or 'cuda'")
+
+    if backend_normalized == "auto":
+        if CUDA_AVAILABLE:
+            backend_normalized = "cuda"
+        elif NUMBA_AVAILABLE:
+            backend_normalized = "numba"
+        else:
+            backend_normalized = "python"
+
+    if backend_normalized == "cuda":
+        results, bonus_hits, agg_stats0, agg_stats1, agg_stats2, elapsed_ms, units = _simulate_cuda_backend(count)
+        run_label = f"CUDA threads={units}"
+    elif backend_normalized == "numba":
+        results, bonus_hits, agg_stats0, agg_stats1, agg_stats2, elapsed_ms, units = _simulate_numba_backend(count)
+        run_label = f"Numba parallel (threads={units})"
+    else:
+        results, bonus_hits, agg_stats0, agg_stats1, agg_stats2, elapsed_ms, units = _simulate_python_backend(count, processes)
+        run_label = f"{units} process(es)"
 
     mean_val = float(np.mean(results))
     std_val = float(np.std(results))
     bonus_probability = bonus_hits / count * 100.0
 
-    print(f"\n--- RESULTS ({count} games across {processes} process(es)) ---")
+    print(f"\n--- RESULTS ({count} games across {run_label}) ---")
     print(f"\nTime: {elapsed_ms:.2f}ms")
 
     df = pd.DataFrame({
