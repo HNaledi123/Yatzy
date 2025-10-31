@@ -218,7 +218,7 @@ def _resolve_keep_strategy(counts):
 
 
 def EvaluateBonus(points):
-    bonus = 50 if points >= 630 else 0
+    bonus = 50 if points >= 63 else 0
     if debug:
         print("Bonus | " + str(bonus))
     return bonus
@@ -388,7 +388,7 @@ if NUMBA_AVAILABLE:
                 upper_points += score
             allowed_mask[chosen_idx] = False
 
-        bonus = 50 if upper_points >= 630 else 0
+        bonus = 50 if upper_points >= 63 else 0
         total_points += bonus
         return total_points, bonus > 0
 
@@ -511,7 +511,7 @@ if CUDA_AVAILABLE:
                 upper_points += best_score
             allowed_mask_local[best_idx] = False
 
-        bonus = 50 if upper_points >= 630 else 0
+        bonus = 50 if upper_points >= 63 else 0
         total_points += bonus
 
         results[idx] = total_points
