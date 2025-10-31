@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import platform
@@ -852,7 +853,7 @@ def SimulateRounds(
         raise RuntimeError("Numba backend requested but numba is not available.")
 
     if chunk_size is None:
-        chunk_size = min(count, 1_000_000)
+        chunk_size = min(count, 10_000_000)
     if chunk_size <= 0:
         raise ValueError("chunk_size must be a positive integer")
     chunk_size = max(1, min(chunk_size, count))
@@ -1070,9 +1071,148 @@ def SimulateRounds(
     print(f"Artifacts saved under: {run_dir}")
 
 
-if __name__ == "__main__":
+def _parse_positive_int(value):
     try:
-        SimulateRounds(1_000_000, processes=os.cpu_count(), chunk_size=100_000)
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected a positive integer, got {value!r}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"Expected a positive integer, got {value!r}")
+    return parsed
+
+
+def _parse_optional_positive_int(value):
+    if value.lower() in {"auto", "none"}:
+        return None
+    return _parse_positive_int(value)
+
+
+def _parse_histogram_bins_arg(value):
+    lowered = value.lower()
+    if lowered in {"auto", "sturges", "fd", "doane", "scott", "stone", "rice", "sqrt"}:
+        return lowered
+    if lowered in {"none", "null"}:
+        return None
+    return _parse_positive_int(value)
+
+
+def _build_argument_parser():
+    parser = argparse.ArgumentParser(
+        description="Run Yatzy simulations and export aggregated statistics."
+    )
+    parser.add_argument(
+        "--count",
+        type=_parse_positive_int,
+        default=1_000_000,
+        help="Number of games to simulate (default: 1,000,000).",
+    )
+    parser.add_argument(
+        "--processes",
+        type=_parse_optional_positive_int,
+        default=16,
+        help="Worker processes for Python backend (default: 16). Use 'auto' to let the program decide.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "python", "numba", "cuda"],
+        default="auto",
+        help="Simulation backend to use (default: auto).",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=_parse_optional_positive_int,
+        default=None,
+        help="Batch size per iteration (default: auto). Use 'auto' to pick a default.",
+    )
+    parser.add_argument(
+        "--store-results-threshold",
+        type=_parse_positive_int,
+        default=1_000_000_000,
+        help="Maximum game count to retain individual scores in memory (default: 1,000,000,000).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="results",
+        help="Directory where run artifacts are written (default: results).",
+    )
+    parser.add_argument(
+        "--histogram-bins",
+        type=_parse_histogram_bins_arg,
+        default=20,
+        help="Bins setting for the score distribution plot (int, 'auto', 'fd', 'sturges', etc.).",
+    )
+    parser.add_argument(
+        "--save-plots",
+        dest="save_plots",
+        action="store_true",
+        default=True,
+        help="Persist generated plots to disk (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-save-plots",
+        dest="save_plots",
+        action="store_false",
+        help="Disable saving plot images.",
+    )
+    parser.add_argument(
+        "--show-plots",
+        dest="show_plots",
+        action="store_true",
+        default=True,
+        help="Display plots interactively (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-show-plots",
+        dest="show_plots",
+        action="store_false",
+        help="Disable interactive plot display.",
+    )
+    parser.add_argument(
+        "--save-run-metadata",
+        dest="save_run_metadata",
+        action="store_true",
+        default=True,
+        help="Export JSON metadata describing the run (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-save-run-metadata",
+        dest="save_run_metadata",
+        action="store_false",
+        help="Skip writing metadata JSON.",
+    )
+    parser.add_argument(
+        "--cleanup",
+        dest="cleanup",
+        action="store_true",
+        default=True,
+        help="Remove __pycache__ directories after the run (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-cleanup",
+        dest="cleanup",
+        action="store_false",
+        help="Leave __pycache__ directories untouched after the run.",
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    cli_parser = _build_argument_parser()
+    cli_args = cli_parser.parse_args()
+    try:
+        SimulateRounds(
+            count=cli_args.count,
+            processes=cli_args.processes,
+            backend=cli_args.backend,
+            chunk_size=cli_args.chunk_size,
+            store_results_threshold=cli_args.store_results_threshold,
+            output_dir=cli_args.output_dir,
+            histogram_bins=cli_args.histogram_bins,
+            save_plots=cli_args.save_plots,
+            show_plots=cli_args.show_plots,
+            save_run_metadata=cli_args.save_run_metadata,
+        )
     finally:
-        script_directory = os.path.dirname(os.path.abspath(__file__))
-        _cleanup_pycache(script_directory)
+        if cli_args.cleanup:
+            script_directory = os.path.dirname(os.path.abspath(__file__))
+            _cleanup_pycache(script_directory)
