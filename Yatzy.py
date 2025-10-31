@@ -1,6 +1,7 @@
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor
+from itertools import product
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -37,6 +38,25 @@ LARGE_STRAIGHT_TEMPLATE = np.array([2, 3, 4, 5, 6], dtype=np.int8)
 NUM_CATEGORIES = len(CATEGORY_NAMES)
 NUM_ROUNDS = NUM_CATEGORIES
 
+ROLL_STATE_COUNT = 6 ** 5
+CATEGORY_PRIORITY = (
+    FACE_TO_UPPER_INDEX[6],
+    FACE_TO_UPPER_INDEX[5],
+    FACE_TO_UPPER_INDEX[4],
+    FACE_TO_UPPER_INDEX[3],
+    FACE_TO_UPPER_INDEX[2],
+    FACE_TO_UPPER_INDEX[1],
+    OF_A_KIND_TO_INDEX[5],
+    OF_A_KIND_TO_INDEX[4],
+    OF_A_KIND_TO_INDEX[3],
+    OF_A_KIND_TO_INDEX[2],
+    CATEGORY_INDEX["TwoPairs"],
+    CATEGORY_INDEX["LargeStraight"],
+    CATEGORY_INDEX["SmallStraight"],
+    CATEGORY_INDEX["FullHouse"],
+    CATEGORY_INDEX["Chance"],
+)
+
 
 ## --- HELPERS ---
 
@@ -47,18 +67,24 @@ def RollDice(count, rng=None):
     return dice if rng is not None else dice.tolist()
 
 
-def _reroll_keep_most_common_array(dice_array, rng):
-    value_counts = np.bincount(dice_array, minlength=7)
-    counts_without_zero = value_counts[1:]
-    max_count = counts_without_zero.max()
-    # choose the highest face among those with the maximum count
-    candidate_faces = np.flatnonzero(counts_without_zero == max_count) + 1
-    keep_value = int(candidate_faces[-1])
-    if max_count == 5:
+def _encode_roll(dice_array):
+    key = 0
+    for value in dice_array:
+        key = key * 6 + (int(value) - 1)
+    return key
+
+
+def _reroll_keep_most_common_array(dice_array, rng, encoded_roll=None):
+    roll_index = _encode_roll(dice_array) if encoded_roll is None else encoded_roll
+    keep_count = int(ROLL_KEEP_COUNT[roll_index])
+    if keep_count == 5:
         return dice_array.copy()
+
+    generator = rng if rng is not None else np.random.default_rng()
+    keep_value = int(ROLL_KEEP_VALUE[roll_index])
     rerolled = np.empty(5, dtype=np.int8)
-    rerolled[:max_count] = keep_value
-    rerolled[max_count:] = rng.integers(1, 7, size=5 - max_count, dtype=np.int8)
+    rerolled[:keep_count] = keep_value
+    rerolled[keep_count:] = generator.integers(1, 7, size=5 - keep_count, dtype=np.int8)
     return rerolled
 
 
@@ -126,6 +152,17 @@ def _score_full_house(counts):
     return score if has_pair and has_three else 0
 
 
+def _resolve_keep_strategy(counts):
+    counts_without_zero = counts[1:]
+    max_count = int(counts_without_zero.max())
+    keep_value = 1
+    for face in range(6, 0, -1):
+        if counts[face] == max_count:
+            keep_value = face
+            break
+    return keep_value, max_count
+
+
 def EvaluateBonus(points):
     bonus = 50 if points >= 63 else 0
     if debug:
@@ -163,103 +200,112 @@ def _satisfied_categories(dice_array, counts, sorted_dice, dice_sum):
     return satisfied
 
 
-def _evaluate_best_category(dice_array, counts, sorted_dice, dice_sum, allowed_mask):
+def _build_roll_cache():
+    score_table = np.zeros((ROLL_STATE_COUNT, NUM_CATEGORIES), dtype=np.int16)
+    sat_matrix = np.zeros((ROLL_STATE_COUNT, NUM_CATEGORIES), dtype=np.uint8)
+    sat_lists = [()] * ROLL_STATE_COUNT
+    keep_values = np.empty(ROLL_STATE_COUNT, dtype=np.int8)
+    keep_counts = np.empty(ROLL_STATE_COUNT, dtype=np.uint8)
+
+    for idx, dice in enumerate(product(range(1, 7), repeat=5)):
+        dice_array = np.array(dice, dtype=np.int8)
+        counts, sorted_dice, dice_sum = _analyze_dice(dice_array)
+        satisfied = _satisfied_categories(dice_array, counts, sorted_dice, dice_sum)
+        if satisfied:
+            sat_matrix[idx, satisfied] = 1
+        sat_lists[idx] = tuple(satisfied)
+
+        keep_value, keep_count = _resolve_keep_strategy(counts)
+        keep_values[idx] = keep_value
+        keep_counts[idx] = keep_count
+
+        row = score_table[idx]
+        for face in range(1, 7):
+            row[FACE_TO_UPPER_INDEX[face]] = _score_upper(counts, face)
+        for required, category_idx in OF_A_KIND_TO_INDEX.items():
+            row[category_idx] = _score_n_of_a_kind(counts, required)
+        row[CATEGORY_INDEX["TwoPairs"]] = _score_two_pairs(dice_array, counts)
+        row[CATEGORY_INDEX["LargeStraight"]] = _score_straight(sorted_dice, 1)
+        row[CATEGORY_INDEX["SmallStraight"]] = _score_straight(sorted_dice, 0)
+        row[CATEGORY_INDEX["FullHouse"]] = _score_full_house(counts)
+        row[CATEGORY_INDEX["Chance"]] = dice_sum
+
+    return score_table, sat_matrix, tuple(sat_lists), keep_values, keep_counts
+
+
+ROLL_SCORE_TABLE, ROLL_SAT_MATRIX, ROLL_SAT_LISTS, ROLL_KEEP_VALUE, ROLL_KEEP_COUNT = _build_roll_cache()
+
+
+def _evaluate_best_category_from_index(roll_index, allowed_mask):
+    scores = ROLL_SCORE_TABLE[roll_index]
     best_score = -1
     best_idx = -1
 
-    for face in range(6, 0, -1):
-        idx = FACE_TO_UPPER_INDEX[face]
+    for idx in CATEGORY_PRIORITY:
         if not allowed_mask[idx]:
             continue
-        score = _score_upper(counts, face)
+        score = int(scores[idx])
         if score > best_score:
             best_score = score
             best_idx = idx
-
-    for required in range(5, 1, -1):
-        idx = OF_A_KIND_TO_INDEX[required]
-        if not allowed_mask[idx]:
-            continue
-        score = _score_n_of_a_kind(counts, required)
-        if score > best_score:
-            best_score = score
-            best_idx = idx
-
-    idx_two_pairs = CATEGORY_INDEX["TwoPairs"]
-    if allowed_mask[idx_two_pairs]:
-        score = _score_two_pairs(dice_array, counts)
-        if score > best_score:
-            best_score = score
-            best_idx = idx_two_pairs
-
-    for size, name in ((1, "LargeStraight"), (0, "SmallStraight")):
-        idx = CATEGORY_INDEX[name]
-        if not allowed_mask[idx]:
-            continue
-        score = _score_straight(sorted_dice, size)
-        if score > best_score:
-            best_score = score
-            best_idx = idx
-
-    idx_full_house = CATEGORY_INDEX["FullHouse"]
-    if allowed_mask[idx_full_house]:
-        score = _score_full_house(counts)
-        if score > best_score:
-            best_score = score
-            best_idx = idx_full_house
-
-    idx_chance = CATEGORY_INDEX["Chance"]
-    if allowed_mask[idx_chance]:
-        if dice_sum > best_score:
-            best_score = dice_sum
-            best_idx = idx_chance
 
     return best_score, best_idx
 
 
+def _evaluate_best_category(dice_array, counts, sorted_dice, dice_sum, allowed_mask):
+    del counts, sorted_dice, dice_sum
+    roll_index = _encode_roll(dice_array)
+    return _evaluate_best_category_from_index(roll_index, allowed_mask)
+
+
 ## --- MAIN GAMEPLAY ---
 
-def PlayYatzy(rng=None):
+def PlayYatzy(rng=None, stats0=None, stats1=None, stats2=None):
     generator = rng if rng is not None else np.random.default_rng()
     allowed_mask = np.ones(NUM_CATEGORIES, dtype=bool)
 
-    stats0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    stats1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    stats2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    if stats0 is None:
+        stats0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    else:
+        stats0.fill(0)
+    if stats1 is None:
+        stats1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    else:
+        stats1.fill(0)
+    if stats2 is None:
+        stats2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    else:
+        stats2.fill(0)
 
     total_points = 0
     upper_points = 0
 
     for round_idx in range(1, NUM_ROUNDS + 1):
         dice0 = RollDice(5, generator)
-        counts0, sorted0, sum0 = _analyze_dice(dice0)
-        satisfied0 = _satisfied_categories(dice0, counts0, sorted0, sum0)
+        idx0 = _encode_roll(dice0)
+        stats0 += ROLL_SAT_MATRIX[idx0]
 
-        dice1 = _reroll_keep_most_common_array(dice0, generator)
-        counts1, sorted1, sum1 = _analyze_dice(dice1)
-        satisfied1 = _satisfied_categories(dice1, counts1, sorted1, sum1)
+        dice1 = _reroll_keep_most_common_array(dice0, generator, idx0)
+        idx1 = _encode_roll(dice1)
+        stats1 += ROLL_SAT_MATRIX[idx1]
 
-        dice2 = _reroll_keep_most_common_array(dice1, generator)
-        counts2, sorted2, sum2 = _analyze_dice(dice2)
-        satisfied2 = _satisfied_categories(dice2, counts2, sorted2, sum2)
+        dice2 = _reroll_keep_most_common_array(dice1, generator, idx1)
+        idx2 = _encode_roll(dice2)
+        stats2 += ROLL_SAT_MATRIX[idx2]
 
-        for idx in satisfied0:
-            stats0[idx] += 1
-        for idx in satisfied1:
-            stats1[idx] += 1
-        for idx in satisfied2:
-            stats2[idx] += 1
-
-        score, chosen_idx = _evaluate_best_category(dice2, counts2, sorted2, sum2, allowed_mask)
+        score, chosen_idx = _evaluate_best_category_from_index(idx2, allowed_mask)
         total_points += score
         if chosen_idx < 6:
             upper_points += score
         allowed_mask[chosen_idx] = False
 
         if debug:
-            print(f"Satisfied 0 (Round {round_idx}) | {[CATEGORY_NAMES[i] for i in satisfied0]}")
-            print(f"Satisfied 1 (Round {round_idx}) | {[CATEGORY_NAMES[i] for i in satisfied1]}")
-            print(f"Satisfied 2 (Round {round_idx}) | {[CATEGORY_NAMES[i] for i in satisfied2]}")
+            satisfied0 = [CATEGORY_NAMES[i] for i in ROLL_SAT_LISTS[idx0]]
+            satisfied1 = [CATEGORY_NAMES[i] for i in ROLL_SAT_LISTS[idx1]]
+            satisfied2 = [CATEGORY_NAMES[i] for i in ROLL_SAT_LISTS[idx2]]
+            print(f"Satisfied 0 (Round {round_idx}) | {satisfied0}")
+            print(f"Satisfied 1 (Round {round_idx}) | {satisfied1}")
+            print(f"Satisfied 2 (Round {round_idx}) | {satisfied2}")
             print(f"Round {round_idx} | {CATEGORY_NAMES[chosen_idx]} | {score}")
 
     bonus = EvaluateBonus(upper_points)
@@ -277,9 +323,12 @@ def _simulate_chunk(task):
     agg_stats0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     agg_stats1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     agg_stats2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    tmp_stats0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    tmp_stats1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    tmp_stats2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
 
     for i in range(count):
-        points, got_bonus, s0, s1, s2 = PlayYatzy(rng)
+        points, got_bonus, s0, s1, s2 = PlayYatzy(rng, tmp_stats0, tmp_stats1, tmp_stats2)
         results[i] = points
         if got_bonus:
             bonus_hits += 1
