@@ -1,0 +1,2 @@
+# Yatzy
+Yatzysimulering och statistik
