@@ -1,8 +1,13 @@
+import json
 import os
+import platform
 import shutil
 import time
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 from itertools import product
+from pathlib import Path
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -814,7 +819,18 @@ class _SimulationAccumulator:
         self._hist_counts = new_counts
 
 
-def SimulateRounds(count, processes=None, backend="auto", chunk_size=None, store_results_threshold=5_000_000):
+def SimulateRounds(
+    count,
+    processes=None,
+    backend="auto",
+    chunk_size=None,
+    store_results_threshold=5_000_000,
+    output_dir="results",
+    histogram_bins=20,
+    save_plots=True,
+    show_plots=True,
+    save_run_metadata=True,
+):
     if count <= 0:
         raise ValueError("count must be a positive integer")
 
@@ -858,6 +874,7 @@ def SimulateRounds(count, processes=None, backend="auto", chunk_size=None, store
         run_label_template = "{units} process(es)"
 
     start_time = time.time()
+    run_start_unix = int(start_time)
     processed = 0
     units_value = None
 
@@ -870,7 +887,8 @@ def SimulateRounds(count, processes=None, backend="auto", chunk_size=None, store
             units_value = units
         del results, stats0_chunk, stats1_chunk, stats2_chunk
 
-    elapsed_ms = (time.time() - start_time) * 1000.0
+    end_time = time.time()
+    elapsed_ms = (end_time - start_time) * 1000.0
     run_label = run_label_template.format(units=units_value if units_value is not None else "?")
 
     mean_val = float(accumulator.mean)
@@ -881,6 +899,25 @@ def SimulateRounds(count, processes=None, backend="auto", chunk_size=None, store
     print(f"\nTime: {elapsed_ms:.2f}ms")
     if not store_results or count > chunk_size:
         print(f"Processed in batches of {chunk_size} games (streaming aggregation).")
+
+    if isinstance(histogram_bins, bool):
+        raise ValueError("histogram_bins cannot be a boolean value")
+    if histogram_bins is None:
+        histogram_bins_effective = "auto"
+    else:
+        histogram_bins_effective = histogram_bins
+        if isinstance(histogram_bins_effective, (int, np.integer)) and histogram_bins_effective <= 0:
+            raise ValueError("histogram_bins must be a positive integer when provided as an int")
+
+    if output_dir:
+        output_root = Path(output_dir)
+    else:
+        output_root = Path.cwd()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    run_basename = f"yatzy_{count}_{run_start_unix}"
+    run_dir = output_root / run_basename
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     df = pd.DataFrame({
         "Category": CATEGORY_NAMES,
@@ -897,54 +934,145 @@ def SimulateRounds(count, processes=None, backend="auto", chunk_size=None, store
         {"Category": "AverageScore", "Roll0_count": mean_val},
         {"Category": "Std", "Roll0_count": std_val},
         {"Category": "Bonus%", "Roll0_count": bonus_probability},
+        {"Category": "ElapsedMs", "Roll0_count": elapsed_ms},
     ])
+    summary_row_count = len(summary)
     df = pd.concat([df, summary], ignore_index=True)
 
-    csv_name = f"yatzy_stats_{count}_{int(time.time())}.csv"
-    df.to_csv(csv_name, index=False)
-    print(f"Exported results to: {csv_name}")
+    data_slice = slice(None, -summary_row_count) if summary_row_count else slice(None)
 
-    plt.figure(figsize=(10, 5))
-    categories_no_summary = df["Category"][:-3]
+    csv_path = run_dir / f"{run_basename}_stats.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"Exported results to: {csv_path}")
+
+    hist_values, hist_counts = accumulator.histogram_values()
+    distribution_df = pd.DataFrame({
+        "Score": hist_values.tolist(),
+        "Count": hist_counts.tolist(),
+    })
+    distribution_path = run_dir / f"{run_basename}_distribution.csv"
+    distribution_df.to_csv(distribution_path, index=False)
+    print(f"Saved per-score counts to: {distribution_path}")
+
+    results_array = accumulator.finalize_results()
+
+    figures = []
+    saved_plot_paths = []
+
+    fig_prob, ax_prob = plt.subplots(figsize=(10, 5))
+    categories_no_summary = df["Category"].iloc[data_slice]
     x = np.arange(len(categories_no_summary))
     width = 0.25
 
-    plt.bar(x - width, df["Roll0_%"][:-3], width, label="First roll")
-    plt.bar(x, df["Roll1_%"][:-3], width, label="Reroll 1")
-    plt.bar(x + width, df["Roll2_%"][:-3], width, label="Reroll 2")
+    ax_prob.bar(x - width, df["Roll0_%"].iloc[data_slice], width, label="First roll")
+    ax_prob.bar(x, df["Roll1_%"].iloc[data_slice], width, label="Reroll 1")
+    ax_prob.bar(x + width, df["Roll2_%"].iloc[data_slice], width, label="Reroll 2")
 
-    plt.title("Probability to satisfy category (initial roll to second reroll)")
-    plt.xlabel("Yatzy category")
-    plt.ylabel("Probability (%)")
-    plt.xticks(x, categories_no_summary, rotation=45)
-    plt.legend()
-    plt.grid(alpha=0.3, axis='y')
-    plt.tight_layout()
-    plt.show()
+    ax_prob.set_title("Probability to satisfy category (initial roll to second reroll)")
+    ax_prob.set_xlabel("Yatzy category")
+    ax_prob.set_ylabel("Probability (%)")
+    ax_prob.set_xticks(x)
+    ax_prob.set_xticklabels(categories_no_summary.to_list(), rotation=45, ha="right")
+    ax_prob.legend()
+    ax_prob.grid(alpha=0.3, axis="y")
+    fig_prob.tight_layout()
 
-    plt.figure(figsize=(8, 4))
-    results_array = accumulator.finalize_results()
-    if results_array is not None:
-        plt.hist(results_array, bins=20, edgecolor='black', alpha=0.7)
+    if save_plots:
+        category_plot_path = run_dir / f"{run_basename}_category_probabilities.png"
+        fig_prob.savefig(category_plot_path, dpi=300)
+        saved_plot_paths.append(category_plot_path)
+        print(f"Saved category probability plot to: {category_plot_path}")
+    figures.append(fig_prob)
+
+    fig_hist, ax_hist = plt.subplots(figsize=(8, 4))
+    if results_array is not None and results_array.size:
+        ax_hist.hist(results_array, bins=histogram_bins_effective, edgecolor="black", alpha=0.7)
+    elif hist_counts.size:
+        ax_hist.hist(hist_values, bins=histogram_bins_effective, weights=hist_counts, edgecolor="black", alpha=0.7)
     else:
-        values, counts = accumulator.histogram_values()
-        if counts.size:
-            plt.bar(values, counts, width=0.9, edgecolor='black', alpha=0.7)
-        else:
-            plt.bar([0], [0], width=0.9, edgecolor='black', alpha=0.7)
-    plt.axvline(mean_val, color='red', linestyle='--', linewidth=2, label=f"Mean = {mean_val:.1f}")
-    plt.title(f"Distribution of Yatzy scores ({count} simulations)")
-    plt.xlabel("Points")
-    plt.ylabel("Games")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.show()
+        ax_hist.bar([0], [0], width=0.9, edgecolor="black", alpha=0.7)
+
+    ax_hist.axvline(mean_val, color="red", linestyle="--", linewidth=2, label=f"Mean = {mean_val:.1f}")
+    ax_hist.set_title(f"Distribution of Yatzy scores ({count} simulations)")
+    ax_hist.set_xlabel("Points")
+    ax_hist.set_ylabel("Games")
+    ax_hist.legend()
+    ax_hist.grid(alpha=0.3)
+    fig_hist.tight_layout()
+
+    if save_plots:
+        histogram_plot_path = run_dir / f"{run_basename}_score_distribution.png"
+        fig_hist.savefig(histogram_plot_path, dpi=300)
+        saved_plot_paths.append(histogram_plot_path)
+        print(f"Saved score distribution plot to: {histogram_plot_path}")
+    figures.append(fig_hist)
+
+    if show_plots:
+        plt.show()
+    else:
+        for fig in figures:
+            plt.close(fig)
+
+    if save_run_metadata:
+        system_info = platform.uname()
+        metadata_path = run_dir / f"{run_basename}_metadata.json"
+        chunk_size_info = int(chunk_size) if chunk_size is not None else None
+        finished_at_utc = datetime.utcfromtimestamp(start_time + elapsed_ms / 1000.0).isoformat(timespec="seconds") + "Z"
+        metadata = {
+            "run": {
+                "count": int(count),
+                "backend_requested": backend,
+                "backend_used": backend_normalized,
+                "run_label": run_label,
+                "processes_requested": processes,
+                "chunk_size": chunk_size_info,
+                "store_results": bool(store_results),
+                "store_results_threshold": int(store_results_threshold),
+                "results_stored": bool(results_array is not None),
+                "bonus_probability_percent": bonus_probability,
+                "average_score": mean_val,
+                "std_dev": std_val,
+                "histogram_bins_requested": histogram_bins,
+                "histogram_bins_effective": histogram_bins_effective,
+                "elapsed_ms": elapsed_ms,
+                "output_directory": str(run_dir),
+                "run_timestamp_unix": run_start_unix,
+            },
+            "timing": {
+                "started_at_utc": datetime.utcfromtimestamp(start_time).isoformat(timespec="seconds") + "Z",
+                "finished_at_utc": finished_at_utc,
+                "elapsed_ms": elapsed_ms,
+                "elapsed_seconds": elapsed_ms / 1000.0,
+            },
+            "system": {
+                "platform": system_info.system,
+                "platform_release": system_info.release,
+                "platform_version": system_info.version,
+                "machine": system_info.machine,
+                "processor": system_info.processor,
+                "python_version": platform.python_version(),
+                "python_implementation": platform.python_implementation(),
+                "python_executable": sys.executable,
+                "cpu_count": os.cpu_count(),
+                "numba_available": NUMBA_AVAILABLE,
+                "cuda_available": CUDA_AVAILABLE,
+            },
+            "artifacts": {
+                "stats_csv": str(csv_path),
+                "distribution_csv": str(distribution_path),
+                "plots": [str(path) for path in saved_plot_paths],
+            },
+        }
+        with metadata_path.open("w", encoding="utf-8") as metadata_file:
+            json.dump(metadata, metadata_file, indent=2)
+        print(f"Saved metadata to: {metadata_path}")
+
+    print(f"Artifacts saved under: {run_dir}")
 
 
 if __name__ == "__main__":
     try:
-        SimulateRounds(1000000000, processes=os.cpu_count(), chunk_size=10000000)
+        SimulateRounds(1_000_000, processes=os.cpu_count(), chunk_size=100_000)
     finally:
         script_directory = os.path.dirname(os.path.abspath(__file__))
         _cleanup_pycache(script_directory)
