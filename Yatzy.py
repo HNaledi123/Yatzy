@@ -727,7 +727,94 @@ def _simulate_cuda_backend(count, threads_per_block=128):
     return results, bonus_hits, agg_stats0, agg_stats1, agg_stats2, elapsed_ms, total_threads
 
 
-def SimulateRounds(count, processes=None, backend="auto"):
+class _SimulationAccumulator:
+    """Aggregate simulation statistics incrementally to avoid storing per-game data."""
+
+    def __init__(self, store_results):
+        self.store_results = store_results
+        self._result_chunks = [] if store_results else None
+        self.total_count = 0
+        self.total_sum = 0.0
+        self.total_sum_sq = 0.0
+        self.total_bonus_hits = 0
+        self.agg_stats0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+        self.agg_stats1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+        self.agg_stats2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+        self._hist_counts = np.zeros(1, dtype=np.int64)
+        self.min_score = None
+        self.max_score = None
+
+    def update(self, results, stats0, stats1, stats2, bonus_hits):
+        if results.size == 0:
+            return
+
+        if self.store_results and self._result_chunks is not None:
+            self._result_chunks.append(results.copy())
+
+        results_int64 = results.astype(np.int64)
+        chunk_sum = float(results_int64.sum())
+        chunk_sum_sq = float(np.dot(results_int64, results_int64))
+        chunk_count = int(results.size)
+
+        self.total_count += chunk_count
+        self.total_sum += chunk_sum
+        self.total_sum_sq += chunk_sum_sq
+        self.total_bonus_hits += int(bonus_hits)
+
+        self.agg_stats0 += np.asarray(stats0, dtype=np.int64)
+        self.agg_stats1 += np.asarray(stats1, dtype=np.int64)
+        self.agg_stats2 += np.asarray(stats2, dtype=np.int64)
+
+        chunk_min = int(results.min())
+        chunk_max = int(results.max())
+        self.min_score = chunk_min if self.min_score is None else min(self.min_score, chunk_min)
+        self.max_score = chunk_max if self.max_score is None else max(self.max_score, chunk_max)
+
+        self._expand_histogram(chunk_max)
+        chunk_counts = np.bincount(results, minlength=chunk_max + 1)
+        self._hist_counts[:chunk_max + 1] += chunk_counts.astype(np.int64)
+        del results_int64
+
+    def finalize_results(self):
+        if not self.store_results or not self._result_chunks:
+            return None
+        if len(self._result_chunks) == 1:
+            return self._result_chunks[0]
+        return np.concatenate(self._result_chunks)
+
+    @property
+    def mean(self):
+        if self.total_count == 0:
+            return 0.0
+        return self.total_sum / self.total_count
+
+    @property
+    def std(self):
+        if self.total_count == 0:
+            return 0.0
+        mean_val = self.mean
+        variance = (self.total_sum_sq / self.total_count) - mean_val * mean_val
+        if variance < 0.0:
+            variance = 0.0
+        return float(np.sqrt(variance))
+
+    def histogram_values(self):
+        if self.total_count == 0:
+            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+        values = np.nonzero(self._hist_counts)[0]
+        counts = self._hist_counts[values]
+        return values, counts
+
+    def _expand_histogram(self, max_value):
+        if max_value < len(self._hist_counts):
+            return
+        new_size = max_value + 1
+        new_counts = np.zeros(new_size, dtype=np.int64)
+        new_counts[:len(self._hist_counts)] = self._hist_counts
+        self._hist_counts = new_counts
+
+
+def SimulateRounds(count, processes=None, backend="auto", chunk_size=None, store_results_threshold=5_000_000):
     if count <= 0:
         raise ValueError("count must be a positive integer")
 
@@ -743,28 +830,63 @@ def SimulateRounds(count, processes=None, backend="auto"):
         else:
             backend_normalized = "python"
 
-    if backend_normalized == "cuda":
-        results, bonus_hits, agg_stats0, agg_stats1, agg_stats2, elapsed_ms, units = _simulate_cuda_backend(count)
-        run_label = f"CUDA threads={units}"
-    elif backend_normalized == "numba":
-        results, bonus_hits, agg_stats0, agg_stats1, agg_stats2, elapsed_ms, units = _simulate_numba_backend(count)
-        run_label = f"Numba parallel (threads={units})"
-    else:
-        results, bonus_hits, agg_stats0, agg_stats1, agg_stats2, elapsed_ms, units = _simulate_python_backend(count, processes)
-        run_label = f"{units} process(es)"
+    if backend_normalized == "cuda" and not CUDA_AVAILABLE:
+        raise RuntimeError("CUDA backend requested but CUDA is not available.")
+    if backend_normalized == "numba" and not NUMBA_AVAILABLE:
+        raise RuntimeError("Numba backend requested but numba is not available.")
 
-    mean_val = float(np.mean(results))
-    std_val = float(np.std(results))
-    bonus_probability = bonus_hits / count * 100.0
+    if chunk_size is None:
+        chunk_size = min(count, 1_000_000)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+    chunk_size = max(1, min(chunk_size, count))
+
+    store_results = count <= store_results_threshold
+    accumulator = _SimulationAccumulator(store_results=store_results)
+
+    if backend_normalized == "cuda":
+        def backend_runner(batch_size):
+            return _simulate_cuda_backend(batch_size)
+        run_label_template = "CUDA threads={units}"
+    elif backend_normalized == "numba":
+        def backend_runner(batch_size):
+            return _simulate_numba_backend(batch_size)
+        run_label_template = "Numba parallel (threads={units})"
+    else:
+        def backend_runner(batch_size):
+            return _simulate_python_backend(batch_size, processes)
+        run_label_template = "{units} process(es)"
+
+    start_time = time.time()
+    processed = 0
+    units_value = None
+
+    while processed < count:
+        batch_size = min(chunk_size, count - processed)
+        results, bonus_hits_chunk, stats0_chunk, stats1_chunk, stats2_chunk, _, units = backend_runner(batch_size)
+        accumulator.update(results, stats0_chunk, stats1_chunk, stats2_chunk, bonus_hits_chunk)
+        processed += batch_size
+        if units_value is None:
+            units_value = units
+        del results, stats0_chunk, stats1_chunk, stats2_chunk
+
+    elapsed_ms = (time.time() - start_time) * 1000.0
+    run_label = run_label_template.format(units=units_value if units_value is not None else "?")
+
+    mean_val = float(accumulator.mean)
+    std_val = float(accumulator.std)
+    bonus_probability = accumulator.total_bonus_hits / count * 100.0
 
     print(f"\n--- RESULTS ({count} games across {run_label}) ---")
     print(f"\nTime: {elapsed_ms:.2f}ms")
+    if not store_results or count > chunk_size:
+        print(f"Processed in batches of {chunk_size} games (streaming aggregation).")
 
     df = pd.DataFrame({
         "Category": CATEGORY_NAMES,
-        "Roll0_count": agg_stats0.tolist(),
-        "Roll1_count": agg_stats1.tolist(),
-        "Roll2_count": agg_stats2.tolist(),
+        "Roll0_count": accumulator.agg_stats0.tolist(),
+        "Roll1_count": accumulator.agg_stats1.tolist(),
+        "Roll2_count": accumulator.agg_stats2.tolist(),
     })
 
     df["Roll0_%"] = df["Roll0_count"] / (count * NUM_ROUNDS) * 100
@@ -801,7 +923,15 @@ def SimulateRounds(count, processes=None, backend="auto"):
     plt.show()
 
     plt.figure(figsize=(8, 4))
-    plt.hist(results, bins=20, edgecolor='black', alpha=0.7)
+    results_array = accumulator.finalize_results()
+    if results_array is not None:
+        plt.hist(results_array, bins=20, edgecolor='black', alpha=0.7)
+    else:
+        values, counts = accumulator.histogram_values()
+        if counts.size:
+            plt.bar(values, counts, width=0.9, edgecolor='black', alpha=0.7)
+        else:
+            plt.bar([0], [0], width=0.9, edgecolor='black', alpha=0.7)
     plt.axvline(mean_val, color='red', linestyle='--', linewidth=2, label=f"Mean = {mean_val:.1f}")
     plt.title(f"Distribution of Yatzy scores ({count} simulations)")
     plt.xlabel("Points")
@@ -814,7 +944,7 @@ def SimulateRounds(count, processes=None, backend="auto"):
 
 if __name__ == "__main__":
     try:
-        SimulateRounds(1000000000, processes=os.cpu_count())
+        SimulateRounds(1000000000, processes=os.cpu_count(), chunk_size=10000000)
     finally:
         script_directory = os.path.dirname(os.path.abspath(__file__))
         _cleanup_pycache(script_directory)
