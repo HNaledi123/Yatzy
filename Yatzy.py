@@ -814,7 +814,7 @@ def SimulateRounds(count, processes=None, backend="auto"):
 
 if __name__ == "__main__":
     try:
-        SimulateRounds(1000000, processes=os.cpu_count())
+        SimulateRounds(1000000000, processes=os.cpu_count())
     finally:
         script_directory = os.path.dirname(os.path.abspath(__file__))
         _cleanup_pycache(script_directory)
