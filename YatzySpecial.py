@@ -1,11 +1,12 @@
 import argparse
 import csv
 import json
+import math
 import os
 import platform
 import shutil
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from concurrent.futures import ProcessPoolExecutor
 from itertools import product
 from pathlib import Path
@@ -100,6 +101,35 @@ CATEGORY_PRIORITY = np.array([
 
 
 ## --- HELPERS ---
+
+def _format_duration(seconds):
+    seconds_int = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(seconds_int, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def _format_elapsed(seconds):
+    seconds_float = max(0.0, float(seconds))
+    if seconds_float < 0.001:
+        return "0ms"
+    if seconds_float < 1.0:
+        return f"{seconds_float * 1000:.0f}ms"
+    if seconds_float < 60.0:
+        return f"{seconds_float:.2f}s"
+    return _format_duration(seconds_float)
+
+
+def _format_completion_timestamp(seconds_from_now):
+    if not math.isfinite(seconds_from_now) or seconds_from_now < 0:
+        return None
+    eta_time = datetime.now().astimezone() + timedelta(seconds=seconds_from_now)
+    return eta_time.isoformat(timespec="seconds")
+
 
 def RollDice(count, rng=None):
     """Roll `count` dice. Returns a NumPy array when an RNG is provided, otherwise a list."""
@@ -1074,6 +1104,7 @@ def SimulateRounds(
 
     while processed < count:
         batch_size = min(chunk_size, count - processed)
+        chunk_start = time.time()
         (
             results,
             bonus_hits_chunk,
@@ -1085,6 +1116,7 @@ def SimulateRounds(
             _,
             units,
         ) = backend_runner(batch_size)
+        chunk_elapsed = time.time() - chunk_start
         accumulator.update(
             results,
             stats0_chunk,
@@ -1098,6 +1130,42 @@ def SimulateRounds(
         if units_value is None:
             units_value = units
         del results, stats0_chunk, stats1_chunk, stats2_chunk, yatzy_flags_chunk, bonus_flags_chunk
+
+        total_elapsed = time.time() - start_time
+        percent_complete = processed / count * 100.0
+        chunk_time_str = _format_elapsed(chunk_elapsed)
+        chunk_rate = batch_size / chunk_elapsed if chunk_elapsed > 0 else None
+        chunk_rate_str = (
+            f"{chunk_rate:,.0f} games/s" if chunk_rate is not None and math.isfinite(chunk_rate) else "n/a"
+        )
+        overall_rate = processed / total_elapsed if total_elapsed > 0 else None
+        overall_rate_str = (
+            f"{overall_rate:,.0f} games/s" if overall_rate is not None and math.isfinite(overall_rate) else "n/a"
+        )
+        remaining = count - processed
+        eta_seconds = None
+        if remaining > 0 and overall_rate is not None and math.isfinite(overall_rate) and overall_rate > 0:
+            eta_seconds = remaining / overall_rate
+        if remaining <= 0:
+            eta_message = "complete"
+        elif eta_seconds is not None and math.isfinite(eta_seconds):
+            eta_display = _format_duration(eta_seconds)
+            completion_str = _format_completion_timestamp(eta_seconds)
+            if completion_str:
+                eta_message = f"{eta_display} (finish ~ {completion_str})"
+            else:
+                eta_message = eta_display
+        else:
+            eta_message = "estimating..."
+
+        print(
+            (
+                f"Chunk complete: {processed:,}/{count:,} ({percent_complete:.2f}%) | "
+                f"chunk {batch_size:,} in {chunk_time_str} ({chunk_rate_str}) | "
+                f"overall {overall_rate_str} | ETA {eta_message}"
+            ),
+            flush=True,
+        )
 
     end_time = time.time()
     elapsed_ms = (end_time - start_time) * 1000.0
