@@ -819,7 +819,7 @@ def SimulateRounds(
     processes=None,
     backend="auto",
     chunk_size=None,
-    store_results_threshold=5_000_000,
+    store_results_threshold=1_000_000_000,
     output_dir="results",
     histogram_bins=20,
     save_plots=True,
