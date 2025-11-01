@@ -306,12 +306,6 @@ def _evaluate_best_category_from_index(roll_index, allowed_mask):
     return best_score, best_idx
 
 
-def _evaluate_best_category(dice_array, counts, sorted_dice, dice_sum, allowed_mask):
-    del counts, sorted_dice, dice_sum
-    roll_index = _encode_roll(dice_array)
-    return _evaluate_best_category_from_index(roll_index, allowed_mask)
-
-
 if NUMBA_AVAILABLE:
     CATEGORY_PRIORITY_NUMBA = CATEGORY_PRIORITY.astype(np.int16)
 
@@ -829,7 +823,7 @@ def SimulateRounds(
     output_dir="results",
     histogram_bins=20,
     save_plots=True,
-    show_plots=True,
+    show_plots=False,
     save_run_metadata=True,
 ):
     if count <= 0:
@@ -1162,8 +1156,8 @@ def _build_argument_parser():
         "--show-plots",
         dest="show_plots",
         action="store_true",
-        default=True,
-        help="Display plots interactively (default: enabled).",
+        default=False,
+        help="Display plots interactively (default: disabled).",
     )
     parser.add_argument(
         "--no-show-plots",
