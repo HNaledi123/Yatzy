@@ -1640,8 +1640,8 @@ def _build_argument_parser():
     parser.add_argument(
         "--store-results-threshold",
         type=_parse_positive_int,
-        default=1_000_000_000,
-        help="Maximum game count to retain individual scores in memory (default: 1,000,000,000).",
+        default=10_000_000,
+        help="Maximum game count to retain individual scores in memory (default: 10,000,000).",
     )
     parser.add_argument(
         "--output-dir",
