@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import os
 import platform
@@ -1187,37 +1188,60 @@ def SimulateRounds(
     hist_values_no_yatzy_bonus, hist_counts_no_yatzy_bonus = hist_combo_dict[(False, True)]
     hist_values_no_yatzy_no_bonus, hist_counts_no_yatzy_no_bonus = hist_combo_dict[(False, False)]
 
-    def _write_distribution(values, counts, path, label):
-        df_dist = pd.DataFrame({"Score": values.tolist(), "Count": counts.tolist()})
-        df_dist.to_csv(path, index=False)
-        print(f"Saved per-score counts for {label} to: {path}")
+    def _build_full_counts(values, counts, length):
+        expanded = np.zeros(length, dtype=np.int64)
+        if values.size:
+            indices = np.asarray(values, dtype=np.int64)
+            expanded[indices] = np.asarray(counts, dtype=np.int64)
+        return expanded
 
-    distribution_path = run_dir / f"{run_basename}_distribution.csv"
-    _write_distribution(hist_values, hist_counts, distribution_path, "all games")
+    max_score_candidates = []
+    if accumulator.max_score is not None:
+        max_score_candidates.append(int(accumulator.max_score))
+    for value_array in (
+        hist_values,
+        hist_values_yatzy,
+        hist_values_no_yatzy,
+        hist_values_bonus,
+        hist_values_no_bonus,
+        hist_values_yatzy_bonus,
+        hist_values_yatzy_no_bonus,
+        hist_values_no_yatzy_bonus,
+        hist_values_no_yatzy_no_bonus,
+    ):
+        if value_array.size:
+            max_score_candidates.append(int(value_array.max()))
+    max_score = max(max_score_candidates) if max_score_candidates else 0
+    if max_score < 0:
+        max_score = 0
+    score_length = max_score + 1
 
-    distribution_yatzy_path = run_dir / f"{run_basename}_distribution_yatzy.csv"
-    _write_distribution(hist_values_yatzy, hist_counts_yatzy, distribution_yatzy_path, "Yatzy games")
+    distribution_columns = [
+        (("Both", "Both"), (hist_values, hist_counts)),
+        (("Both", "Yes"), (hist_values_yatzy, hist_counts_yatzy)),
+        (("Both", "No"), (hist_values_no_yatzy, hist_counts_no_yatzy)),
+        (("Yes", "Both"), (hist_values_bonus, hist_counts_bonus)),
+        (("No", "Both"), (hist_values_no_bonus, hist_counts_no_bonus)),
+        (("Yes", "Yes"), (hist_values_yatzy_bonus, hist_counts_yatzy_bonus)),
+        (("Yes", "No"), (hist_values_no_yatzy_bonus, hist_counts_no_yatzy_bonus)),
+        (("No", "Yes"), (hist_values_yatzy_no_bonus, hist_counts_yatzy_no_bonus)),
+        (("No", "No"), (hist_values_no_yatzy_no_bonus, hist_counts_no_yatzy_no_bonus)),
+    ]
 
-    distribution_no_yatzy_path = run_dir / f"{run_basename}_distribution_no_yatzy.csv"
-    _write_distribution(hist_values_no_yatzy, hist_counts_no_yatzy, distribution_no_yatzy_path, "non-Yatzy games")
+    consolidated_counts = {
+        labels: _build_full_counts(values, counts, score_length)
+        for labels, (values, counts) in distribution_columns
+    }
 
-    distribution_bonus_path = run_dir / f"{run_basename}_distribution_bonus.csv"
-    _write_distribution(hist_values_bonus, hist_counts_bonus, distribution_bonus_path, "bonus games")
-
-    distribution_no_bonus_path = run_dir / f"{run_basename}_distribution_no_bonus.csv"
-    _write_distribution(hist_values_no_bonus, hist_counts_no_bonus, distribution_no_bonus_path, "non-bonus games")
-
-    distribution_yatzy_bonus_path = run_dir / f"{run_basename}_distribution_yatzy_bonus.csv"
-    _write_distribution(hist_values_yatzy_bonus, hist_counts_yatzy_bonus, distribution_yatzy_bonus_path, "Yatzy + bonus games")
-
-    distribution_yatzy_no_bonus_path = run_dir / f"{run_basename}_distribution_yatzy_no_bonus.csv"
-    _write_distribution(hist_values_yatzy_no_bonus, hist_counts_yatzy_no_bonus, distribution_yatzy_no_bonus_path, "Yatzy without bonus games")
-
-    distribution_no_yatzy_bonus_path = run_dir / f"{run_basename}_distribution_no_yatzy_bonus.csv"
-    _write_distribution(hist_values_no_yatzy_bonus, hist_counts_no_yatzy_bonus, distribution_no_yatzy_bonus_path, "no Yatzy + bonus games")
-
-    distribution_no_yatzy_no_bonus_path = run_dir / f"{run_basename}_distribution_no_yatzy_no_bonus.csv"
-    _write_distribution(hist_values_no_yatzy_no_bonus, hist_counts_no_yatzy_no_bonus, distribution_no_yatzy_no_bonus_path, "no Yatzy + no bonus games")
+    consolidated_distribution_path = run_dir / f"{run_basename}_distributions.csv"
+    with consolidated_distribution_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["Bonus?"] + [labels[0] for labels, _ in distribution_columns])
+        writer.writerow(["Yatzy?"] + [labels[1] for labels, _ in distribution_columns])
+        writer.writerow([f"Score (0-{max_score})"] + ["Count"] * len(distribution_columns))
+        for score in range(score_length):
+            writer.writerow([score] + [int(consolidated_counts[labels][score]) for labels, _ in distribution_columns])
+    print(f"Saved consolidated distributions to: {consolidated_distribution_path}")
 
     results_array = accumulator.finalize_results()
     yatzy_flags_array = accumulator.finalize_yatzy_flags()
@@ -1481,15 +1505,7 @@ def SimulateRounds(
             },
             "artifacts": {
                 "stats_csv": str(csv_path),
-                "distribution_csv": str(distribution_path),
-                "distribution_yatzy_csv": str(distribution_yatzy_path),
-                "distribution_no_yatzy_csv": str(distribution_no_yatzy_path),
-                "distribution_bonus_csv": str(distribution_bonus_path),
-                "distribution_no_bonus_csv": str(distribution_no_bonus_path),
-                "distribution_yatzy_bonus_csv": str(distribution_yatzy_bonus_path),
-                "distribution_yatzy_no_bonus_csv": str(distribution_yatzy_no_bonus_path),
-                "distribution_no_yatzy_bonus_csv": str(distribution_no_yatzy_bonus_path),
-                "distribution_no_yatzy_no_bonus_csv": str(distribution_no_yatzy_no_bonus_path),
+                "distribution_csv": str(consolidated_distribution_path),
                 "plots": [str(path) for path in saved_plot_paths],
             },
         }
