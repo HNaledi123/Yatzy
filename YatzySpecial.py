@@ -539,8 +539,70 @@ def _simulate_numba_backend(count):
     )
 
 
+_HISTOGRAM_KEYS = (
+    "all",
+    "yatzy",
+    "no_yatzy",
+    "bonus",
+    "no_bonus",
+    "yatzy_bonus",
+    "yatzy_no_bonus",
+    "no_yatzy_bonus",
+    "no_yatzy_no_bonus",
+)
+
+
+_HISTOGRAM_SPECS = [
+    ("all", "All games", ("Both", "Both"), "score_distribution.png"),
+    ("yatzy", "Yatzy achieved", ("Both", "Yes"), "score_distribution_yatzy.png"),
+    ("no_yatzy", "No Yatzy", ("Both", "No"), "score_distribution_no_yatzy.png"),
+    ("bonus", "Bonus achieved", ("Yes", "Both"), "score_distribution_bonus.png"),
+    ("no_bonus", "No bonus", ("No", "Both"), "score_distribution_no_bonus.png"),
+    ("yatzy_bonus", "Yatzy + bonus", ("Yes", "Yes"), "score_distribution_yatzy_bonus.png"),
+    ("yatzy_no_bonus", "Yatzy without bonus", ("Yes", "No"), "score_distribution_yatzy_no_bonus.png"),
+    ("no_yatzy_bonus", "No Yatzy + bonus", ("No", "Yes"), "score_distribution_no_yatzy_bonus.png"),
+    ("no_yatzy_no_bonus", "No Yatzy + no bonus", ("No", "No"), "score_distribution_no_yatzy_no_bonus.png"),
+]
+
+
+class _HistogramStore:
+    """Utility to maintain aligned histograms for different boolean slices."""
+
+    def __init__(self, keys):
+        self._counts = {key: np.zeros(1, dtype=np.int64) for key in keys}
+
+    def ensure_capacity(self, max_score):
+        required = max_score + 1
+        for key, arr in self._counts.items():
+            if arr.size <= max_score:
+                expanded = np.zeros(required, dtype=np.int64)
+                expanded[: arr.size] = arr
+                self._counts[key] = expanded
+
+    def update(self, scores, masks):
+        if scores.size == 0:
+            return
+        max_score = int(scores.max())
+        self.ensure_capacity(max_score)
+        for key, mask in masks.items():
+            counts = self._counts[key]
+            weights = None if mask is None else mask.astype(np.int64, copy=False)
+            updated = np.bincount(scores, weights=weights, minlength=counts.size)
+            if updated.dtype != np.int64:
+                updated = np.rint(updated).astype(np.int64)
+            counts[: updated.size] += updated
+
+    def values_counts(self, key):
+        counts = self._counts[key]
+        values = np.nonzero(counts)[0]
+        return values, counts[values]
+
+    def copy_counts(self, key):
+        return self._counts[key].copy()
+
+
 class _SimulationAccumulator:
-    """Aggregate simulation statistics incrementally to avoid storing per-game data."""
+    """Aggregate simulation statistics without storing every game result."""
 
     def __init__(self, store_results):
         self.store_results = store_results
@@ -559,120 +621,83 @@ class _SimulationAccumulator:
         self.agg_stats0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
         self.agg_stats1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
         self.agg_stats2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-        self._hist_counts = np.zeros(1, dtype=np.int64)
-        self._hist_counts_yatzy = np.zeros(1, dtype=np.int64)
-        self._hist_counts_non_yatzy = np.zeros(1, dtype=np.int64)
-        self._hist_counts_bonus = np.zeros(1, dtype=np.int64)
-        self._hist_counts_no_bonus = np.zeros(1, dtype=np.int64)
-        self._hist_counts_yatzy_bonus = np.zeros(1, dtype=np.int64)
-        self._hist_counts_yatzy_no_bonus = np.zeros(1, dtype=np.int64)
-        self._hist_counts_no_yatzy_bonus = np.zeros(1, dtype=np.int64)
-        self._hist_counts_no_yatzy_no_bonus = np.zeros(1, dtype=np.int64)
+        self._histograms = _HistogramStore(_HISTOGRAM_KEYS)
         self.min_score = None
         self.max_score = None
 
-    def update(self, results, stats0, stats1, stats2, bonus_hits, yatzy_flags, bonus_flags):
-        if results.size == 0:
+    def _store_optional_chunks(self, scores, yatzy_flags, bonus_flags):
+        if not self.store_results:
             return
+        if self._result_chunks is not None:
+            self._result_chunks.append(np.asarray(scores, dtype=np.int32).copy())
+        if self._yatzy_chunks is not None:
+            self._yatzy_chunks.append(np.asarray(yatzy_flags, dtype=bool).copy())
+        if self._bonus_chunks is not None:
+            self._bonus_chunks.append(np.asarray(bonus_flags, dtype=bool).copy())
+
+    def update(self, results, stats0, stats1, stats2, bonus_hits, yatzy_flags, bonus_flags):
+        scores_src = np.asarray(results)
+        if scores_src.size == 0:
+            return
+        if scores_src.ndim != 1:
+            raise ValueError("results must be one-dimensional")
 
         yatzy_flags_arr = np.asarray(yatzy_flags, dtype=np.uint8)
-        if yatzy_flags_arr.size != results.size:
-            raise ValueError("yatzy_flags must match results in length")
         bonus_flags_arr = np.asarray(bonus_flags, dtype=np.uint8)
-        if bonus_flags_arr.size != results.size:
-            raise ValueError("bonus_flags must match results in length")
+        if yatzy_flags_arr.size != scores_src.size or bonus_flags_arr.size != scores_src.size:
+            raise ValueError("flag arrays must match results in length")
 
-        if self.store_results and self._result_chunks is not None:
-            self._result_chunks.append(results.copy())
-        if self.store_results and self._yatzy_chunks is not None:
-            self._yatzy_chunks.append(yatzy_flags_arr.astype(np.bool_, copy=True))
-        if self.store_results and self._bonus_chunks is not None:
-            self._bonus_chunks.append(bonus_flags_arr.astype(np.bool_, copy=True))
+        self._store_optional_chunks(scores_src, yatzy_flags_arr, bonus_flags_arr)
 
-        results_int64 = results.astype(np.int64)
-        chunk_sum = float(results_int64.sum())
-        chunk_sum_sq = float(np.dot(results_int64, results_int64))
-        chunk_count = int(results.size)
-
+        scores = scores_src.astype(np.int64, copy=False)
+        chunk_sum = float(scores.sum())
+        chunk_sum_sq = float(np.dot(scores, scores))
+        chunk_count = int(scores.size)
         self.total_count += chunk_count
         self.total_sum += chunk_sum
         self.total_sum_sq += chunk_sum_sq
-        yatzy_bool = yatzy_flags_arr.astype(np.bool_)
-        bonus_bool = bonus_flags_arr.astype(np.bool_)
-        bonus_hits_int = int(bonus_bool.sum())
-        if bonus_hits_int != int(bonus_hits):
-            raise ValueError("bonus_hits does not match sum of bonus flags for chunk")
-        self.total_bonus_hits += bonus_hits_int
-        yatzy_hits_int = int(yatzy_bool.sum())
-        self.total_yatzy_hits += yatzy_hits_int
-        yatzy_and_bonus = int(np.count_nonzero(np.logical_and(yatzy_bool, bonus_bool)))
-        yatzy_no_bonus = int(np.count_nonzero(np.logical_and(yatzy_bool, np.logical_not(bonus_bool))))
-        no_yatzy_bonus = int(np.count_nonzero(np.logical_and(np.logical_not(yatzy_bool), bonus_bool)))
-        no_yatzy_no_bonus = chunk_count - yatzy_and_bonus - yatzy_no_bonus - no_yatzy_bonus
-        self.total_yatzy_and_bonus += yatzy_and_bonus
-        self.total_yatzy_no_bonus += yatzy_no_bonus
-        self.total_no_yatzy_bonus += no_yatzy_bonus
-        self.total_no_yatzy_no_bonus += no_yatzy_no_bonus
+
+        yatzy_mask = yatzy_flags_arr.astype(bool, copy=False)
+        bonus_mask = bonus_flags_arr.astype(bool, copy=False)
+        not_yatzy = ~yatzy_mask
+        not_bonus = ~bonus_mask
+        combo_yatzy_bonus = yatzy_mask & bonus_mask
+        combo_yatzy_no_bonus = yatzy_mask & not_bonus
+        combo_no_yatzy_bonus = not_yatzy & bonus_mask
+        combo_no_yatzy_no_bonus = not_yatzy & not_bonus
+
+        computed_bonus_hits = int(bonus_mask.sum())
+        if int(bonus_hits) != computed_bonus_hits:
+            raise ValueError("bonus_hits does not match sum of bonus flags")
+
+        self.total_bonus_hits += computed_bonus_hits
+        self.total_yatzy_hits += int(yatzy_mask.sum())
+        self.total_yatzy_and_bonus += int(combo_yatzy_bonus.sum())
+        self.total_yatzy_no_bonus += int(combo_yatzy_no_bonus.sum())
+        self.total_no_yatzy_bonus += int(combo_no_yatzy_bonus.sum())
+        self.total_no_yatzy_no_bonus += int(combo_no_yatzy_no_bonus.sum())
 
         self.agg_stats0 += np.asarray(stats0, dtype=np.int64)
         self.agg_stats1 += np.asarray(stats1, dtype=np.int64)
         self.agg_stats2 += np.asarray(stats2, dtype=np.int64)
 
-        chunk_min = int(results.min())
-        chunk_max = int(results.max())
+        chunk_min = int(scores.min())
+        chunk_max = int(scores.max())
         self.min_score = chunk_min if self.min_score is None else min(self.min_score, chunk_min)
         self.max_score = chunk_max if self.max_score is None else max(self.max_score, chunk_max)
 
-        self._expand_histogram(chunk_max)
-        chunk_counts = np.bincount(results, minlength=chunk_max + 1).astype(np.int64)
-        self._hist_counts[:chunk_max + 1] += chunk_counts
-
-        chunk_counts_yatzy = np.bincount(
-            results,
-            weights=yatzy_bool.astype(np.float64),
-            minlength=chunk_max + 1,
-        )
-        if chunk_counts_yatzy.size:
-            chunk_counts_yatzy = np.rint(chunk_counts_yatzy).astype(np.int64)
-        self._hist_counts_yatzy[:chunk_max + 1] += chunk_counts_yatzy
-        chunk_counts_non_yatzy = chunk_counts - chunk_counts_yatzy
-        self._hist_counts_non_yatzy[:chunk_max + 1] += chunk_counts_non_yatzy
-
-        chunk_counts_bonus = np.bincount(
-            results,
-            weights=bonus_bool.astype(np.float64),
-            minlength=chunk_max + 1,
-        )
-        if chunk_counts_bonus.size:
-            chunk_counts_bonus = np.rint(chunk_counts_bonus).astype(np.int64)
-        self._hist_counts_bonus[:chunk_max + 1] += chunk_counts_bonus
-        chunk_counts_no_bonus = chunk_counts - chunk_counts_bonus
-        self._hist_counts_no_bonus[:chunk_max + 1] += chunk_counts_no_bonus
-
-        yb_weights = np.logical_and(yatzy_bool, bonus_bool).astype(np.float64)
-        ynb_weights = np.logical_and(yatzy_bool, np.logical_not(bonus_bool)).astype(np.float64)
-        nyb_weights = np.logical_and(np.logical_not(yatzy_bool), bonus_bool).astype(np.float64)
-        nynb_weights = np.logical_and(np.logical_not(yatzy_bool), np.logical_not(bonus_bool)).astype(np.float64)
-
-        chunk_counts_yatzy_bonus = np.bincount(results, weights=yb_weights, minlength=chunk_max + 1)
-        chunk_counts_yatzy_no_bonus = np.bincount(results, weights=ynb_weights, minlength=chunk_max + 1)
-        chunk_counts_no_yatzy_bonus = np.bincount(results, weights=nyb_weights, minlength=chunk_max + 1)
-        chunk_counts_no_yatzy_no_bonus = np.bincount(results, weights=nynb_weights, minlength=chunk_max + 1)
-
-        if chunk_counts_yatzy_bonus.size:
-            chunk_counts_yatzy_bonus = np.rint(chunk_counts_yatzy_bonus).astype(np.int64)
-        if chunk_counts_yatzy_no_bonus.size:
-            chunk_counts_yatzy_no_bonus = np.rint(chunk_counts_yatzy_no_bonus).astype(np.int64)
-        if chunk_counts_no_yatzy_bonus.size:
-            chunk_counts_no_yatzy_bonus = np.rint(chunk_counts_no_yatzy_bonus).astype(np.int64)
-        if chunk_counts_no_yatzy_no_bonus.size:
-            chunk_counts_no_yatzy_no_bonus = np.rint(chunk_counts_no_yatzy_no_bonus).astype(np.int64)
-
-        self._hist_counts_yatzy_bonus[:chunk_max + 1] += chunk_counts_yatzy_bonus
-        self._hist_counts_yatzy_no_bonus[:chunk_max + 1] += chunk_counts_yatzy_no_bonus
-        self._hist_counts_no_yatzy_bonus[:chunk_max + 1] += chunk_counts_no_yatzy_bonus
-        self._hist_counts_no_yatzy_no_bonus[:chunk_max + 1] += chunk_counts_no_yatzy_no_bonus
-        del results_int64
+        histogram_masks = {
+            "all": None,
+            "yatzy": yatzy_mask,
+            "no_yatzy": not_yatzy,
+            "bonus": bonus_mask,
+            "no_bonus": not_bonus,
+            "yatzy_bonus": combo_yatzy_bonus,
+            "yatzy_no_bonus": combo_yatzy_no_bonus,
+            "no_yatzy_bonus": combo_no_yatzy_bonus,
+            "no_yatzy_no_bonus": combo_no_yatzy_no_bonus,
+        }
+        self._histograms.update(scores, histogram_masks)
 
     def finalize_results(self):
         if not self.store_results or not self._result_chunks:
@@ -713,30 +738,27 @@ class _SimulationAccumulator:
 
     def histogram_values(self):
         if self.total_count == 0:
-            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
-        values = np.nonzero(self._hist_counts)[0]
-        counts = self._hist_counts[values]
-        return values, counts
+            empty = np.array([], dtype=np.int64)
+            return empty, empty
+        return self._histograms.values_counts("all")
 
     def histogram_values_by_yatzy(self):
         if self.total_count == 0:
             empty = np.array([], dtype=np.int64)
             return (empty, empty), (empty, empty)
-        values_yatzy = np.nonzero(self._hist_counts_yatzy)[0]
-        counts_yatzy = self._hist_counts_yatzy[values_yatzy]
-        values_non = np.nonzero(self._hist_counts_non_yatzy)[0]
-        counts_non = self._hist_counts_non_yatzy[values_non]
-        return (values_yatzy, counts_yatzy), (values_non, counts_non)
+        return (
+            self._histograms.values_counts("yatzy"),
+            self._histograms.values_counts("no_yatzy"),
+        )
 
     def histogram_values_by_bonus(self):
         if self.total_count == 0:
             empty = np.array([], dtype=np.int64)
             return (empty, empty), (empty, empty)
-        values_bonus = np.nonzero(self._hist_counts_bonus)[0]
-        counts_bonus = self._hist_counts_bonus[values_bonus]
-        values_no_bonus = np.nonzero(self._hist_counts_no_bonus)[0]
-        counts_no_bonus = self._hist_counts_no_bonus[values_no_bonus]
-        return (values_bonus, counts_bonus), (values_no_bonus, counts_no_bonus)
+        return (
+            self._histograms.values_counts("bonus"),
+            self._histograms.values_counts("no_bonus"),
+        )
 
     def histogram_values_by_yatzy_and_bonus(self):
         if self.total_count == 0:
@@ -747,35 +769,236 @@ class _SimulationAccumulator:
                 (False, True): (empty, empty),
                 (False, False): (empty, empty),
             }
-        def _extract(arr):
-            values = np.nonzero(arr)[0]
-            counts = arr[values]
-            return values, counts
         return {
-            (True, True): _extract(self._hist_counts_yatzy_bonus),
-            (True, False): _extract(self._hist_counts_yatzy_no_bonus),
-            (False, True): _extract(self._hist_counts_no_yatzy_bonus),
-            (False, False): _extract(self._hist_counts_no_yatzy_no_bonus),
+            (True, True): self._histograms.values_counts("yatzy_bonus"),
+            (True, False): self._histograms.values_counts("yatzy_no_bonus"),
+            (False, True): self._histograms.values_counts("no_yatzy_bonus"),
+            (False, False): self._histograms.values_counts("no_yatzy_no_bonus"),
         }
 
-    def _expand_histogram(self, max_value):
-        if max_value < len(self._hist_counts):
-            return
-        new_size = max_value + 1
-        def _resize(array):
-            new_arr = np.zeros(new_size, dtype=np.int64)
-            length = len(array)
-            new_arr[:length] = array
-            return new_arr
-        self._hist_counts = _resize(self._hist_counts)
-        self._hist_counts_yatzy = _resize(self._hist_counts_yatzy)
-        self._hist_counts_non_yatzy = _resize(self._hist_counts_non_yatzy)
-        self._hist_counts_bonus = _resize(self._hist_counts_bonus)
-        self._hist_counts_no_bonus = _resize(self._hist_counts_no_bonus)
-        self._hist_counts_yatzy_bonus = _resize(self._hist_counts_yatzy_bonus)
-        self._hist_counts_yatzy_no_bonus = _resize(self._hist_counts_yatzy_no_bonus)
-        self._hist_counts_no_yatzy_bonus = _resize(self._hist_counts_no_yatzy_bonus)
-        self._hist_counts_no_yatzy_no_bonus = _resize(self._hist_counts_no_yatzy_no_bonus)
+    def histogram_full_counts(self):
+        return {key: self._histograms.copy_counts(key) for key in _HISTOGRAM_KEYS}
+
+
+def _format_eta_message(remaining, overall_rate):
+    if remaining <= 0:
+        return "complete"
+    if overall_rate is None or not math.isfinite(overall_rate) or overall_rate <= 0:
+        return "estimating..."
+    eta_seconds = remaining / overall_rate
+    completion_str = _format_completion_timestamp(eta_seconds)
+    duration_str = _format_duration(eta_seconds)
+    return f"{duration_str} (finish ~ {completion_str})" if completion_str else duration_str
+
+
+def _format_progress_message(processed, count, batch_size, chunk_elapsed, start_time):
+    percent_complete = processed / count * 100.0
+    chunk_time_str = _format_elapsed(chunk_elapsed)
+    chunk_rate = batch_size / chunk_elapsed if chunk_elapsed > 0 else None
+    chunk_rate_str = (
+        f"{chunk_rate:,.0f} games/s" if chunk_rate is not None and math.isfinite(chunk_rate) else "n/a"
+    )
+    total_elapsed = time.time() - start_time
+    overall_rate = processed / total_elapsed if total_elapsed > 0 else None
+    overall_rate_str = (
+        f"{overall_rate:,.0f} games/s" if overall_rate is not None and math.isfinite(overall_rate) else "n/a"
+    )
+    eta_message = _format_eta_message(count - processed, overall_rate)
+    return (
+        f"Chunk complete: {processed:,}/{count:,} ({percent_complete:.2f}%) | "
+        f"chunk {batch_size:,} in {chunk_time_str} ({chunk_rate_str}) | "
+        f"overall {overall_rate_str} | ETA {eta_message}"
+    )
+
+
+def _build_stats_dataframe(accumulator, count, mean_val, std_val, elapsed_ms):
+    base_df = pd.DataFrame({
+        "Category": CATEGORY_NAMES,
+        "Roll0_count": accumulator.agg_stats0.tolist(),
+        "Roll1_count": accumulator.agg_stats1.tolist(),
+        "Roll2_count": accumulator.agg_stats2.tolist(),
+    })
+    roll_total = count * NUM_ROUNDS
+    base_df["Roll0_%"] = base_df["Roll0_count"] / roll_total * 100
+    base_df["Roll1_%"] = base_df["Roll1_count"] / roll_total * 100
+    base_df["Roll2_%"] = base_df["Roll2_count"] / roll_total * 100
+
+    summary_rows = [
+        {"Category": "AverageScore", "Roll0_count": mean_val},
+        {"Category": "Std", "Roll0_count": std_val},
+        {"Category": "Bonus%", "Roll0_count": accumulator.total_bonus_hits / count * 100.0},
+        {"Category": "Yatzy%", "Roll0_count": accumulator.total_yatzy_hits / count * 100.0},
+        {"Category": "YatzyCount", "Roll0_count": accumulator.total_yatzy_hits},
+        {"Category": "BonusCount", "Roll0_count": accumulator.total_bonus_hits},
+        {"Category": "Yatzy+BonusCount", "Roll0_count": accumulator.total_yatzy_and_bonus},
+        {"Category": "Yatzy+Bonus%", "Roll0_count": accumulator.total_yatzy_and_bonus / count * 100.0},
+        {"Category": "YatzyNoBonusCount", "Roll0_count": accumulator.total_yatzy_no_bonus},
+        {"Category": "YatzyNoBonus%", "Roll0_count": accumulator.total_yatzy_no_bonus / count * 100.0},
+        {"Category": "NoYatzyBonusCount", "Roll0_count": accumulator.total_no_yatzy_bonus},
+        {"Category": "NoYatzyBonus%", "Roll0_count": accumulator.total_no_yatzy_bonus / count * 100.0},
+        {"Category": "NoYatzyNoBonusCount", "Roll0_count": accumulator.total_no_yatzy_no_bonus},
+        {"Category": "NoYatzyNoBonus%", "Roll0_count": accumulator.total_no_yatzy_no_bonus / count * 100.0},
+        {"Category": "ElapsedMs", "Roll0_count": elapsed_ms},
+    ]
+    summary_df = pd.DataFrame(summary_rows)
+    combined = pd.concat([base_df, summary_df], ignore_index=True)
+    return combined, len(summary_rows)
+
+
+def _collect_histogram_slices(accumulator):
+    slices = {"all": accumulator.histogram_values()}
+    slices["yatzy"], slices["no_yatzy"] = accumulator.histogram_values_by_yatzy()
+    slices["bonus"], slices["no_bonus"] = accumulator.histogram_values_by_bonus()
+    combo = accumulator.histogram_values_by_yatzy_and_bonus()
+    slices["yatzy_bonus"] = combo[(True, True)]
+    slices["yatzy_no_bonus"] = combo[(True, False)]
+    slices["no_yatzy_bonus"] = combo[(False, True)]
+    slices["no_yatzy_no_bonus"] = combo[(False, False)]
+    return slices
+
+
+def _extract_stored_subsets(accumulator):
+    results = accumulator.finalize_results()
+    yatzy_flags = accumulator.finalize_yatzy_flags()
+    bonus_flags = accumulator.finalize_bonus_flags()
+    if (
+        results is None
+        or yatzy_flags is None
+        or bonus_flags is None
+        or results.size == 0
+    ):
+        return {}
+
+    scores = np.asarray(results)
+    yatzy_mask = np.asarray(yatzy_flags, dtype=bool)
+    bonus_mask = np.asarray(bonus_flags, dtype=bool)
+    not_yatzy = ~yatzy_mask
+    not_bonus = ~bonus_mask
+
+    return {
+        "all": scores,
+        "yatzy": scores[yatzy_mask],
+        "no_yatzy": scores[not_yatzy],
+        "bonus": scores[bonus_mask],
+        "no_bonus": scores[not_bonus],
+        "yatzy_bonus": scores[yatzy_mask & bonus_mask],
+        "yatzy_no_bonus": scores[yatzy_mask & not_bonus],
+        "no_yatzy_bonus": scores[not_yatzy & bonus_mask],
+        "no_yatzy_no_bonus": scores[not_yatzy & not_bonus],
+    }
+
+
+def _max_observed_score(counts_map):
+    candidates = []
+    for counts in counts_map.values():
+        if counts.size == 0:
+            continue
+        nonzero = np.nonzero(counts)[0]
+        if nonzero.size:
+            candidates.append(int(nonzero.max()))
+    return max(candidates) if candidates else 0
+
+
+def _write_distribution_csv(run_dir, run_basename, counts_map, max_score):
+    path = run_dir / f"{run_basename}_distributions.csv"
+    with path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["Bonus?"] + [labels[0] for _, _, labels, _ in _HISTOGRAM_SPECS])
+        writer.writerow(["Yatzy?"] + [labels[1] for _, _, labels, _ in _HISTOGRAM_SPECS])
+        writer.writerow([f"Score (0-{max_score})"] + ["Count"] * len(_HISTOGRAM_SPECS))
+        for score in range(max_score + 1):
+            row = [score]
+            for key, _, _, _ in _HISTOGRAM_SPECS:
+                counts = counts_map[key]
+                value = int(counts[score]) if score < counts.size else 0
+                row.append(value)
+            writer.writerow(row)
+    return path
+
+
+def _histogram_mean(values, counts):
+    if counts.size == 0:
+        return None
+    total = counts.sum()
+    if total == 0:
+        return None
+    return float(np.dot(values.astype(np.float64), counts.astype(np.float64)) / float(total))
+
+
+def _plot_category_probabilities(df, data_slice, run_dir, run_basename, save_plots):
+    fig, ax = plt.subplots(figsize=(10, 5))
+    categories = df["Category"].iloc[data_slice]
+    positions = np.arange(len(categories))
+    width = 0.25
+
+    ax.bar(positions - width, df["Roll0_%"].iloc[data_slice], width, label="First roll")
+    ax.bar(positions, df["Roll1_%"].iloc[data_slice], width, label="Reroll 1")
+    ax.bar(positions + width, df["Roll2_%"].iloc[data_slice], width, label="Reroll 2")
+
+    ax.set_title("Probability to satisfy category (initial roll to second reroll)")
+    ax.set_xlabel("Yatzy category")
+    ax.set_ylabel("Probability (%)")
+    ax.set_xticks(positions)
+    ax.set_xticklabels(categories.to_list(), rotation=45, ha="right")
+    ax.legend()
+    ax.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+
+    saved_path = None
+    if save_plots:
+        saved_path = run_dir / f"{run_basename}_category_probabilities.png"
+        fig.savefig(saved_path, dpi=300)
+    return fig, saved_path
+
+
+def _plot_score_histograms(
+    run_dir,
+    run_basename,
+    histogram_bins,
+    stored_subsets,
+    histogram_slices,
+    save_plots,
+):
+    figures = []
+    saved_paths = []
+    for key, title, _, filename in _HISTOGRAM_SPECS:
+        values, counts = histogram_slices[key]
+        data_array = stored_subsets.get(key)
+        subset_total = int(data_array.size) if data_array is not None else int(counts.sum())
+        mean_val = _histogram_mean(values, counts)
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        if data_array is not None and data_array.size:
+            ax.hist(data_array, bins=histogram_bins, edgecolor="black", alpha=0.7)
+        elif counts.size:
+            ax.hist(values, bins=histogram_bins, weights=counts, edgecolor="black", alpha=0.7)
+        else:
+            ax.bar([0], [0], width=0.9, edgecolor="black", alpha=0.7)
+
+        if mean_val is not None:
+            ax.axvline(mean_val, color="red", linestyle="--", linewidth=2, label=f"Mean = {mean_val:.1f}")
+            ax.legend()
+
+        ax.set_title(f"Distribution of Yatzy scores ({title})")
+        ax.set_xlabel("Points")
+        ax.set_ylabel(f"Games (n={subset_total})")
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+
+        if save_plots:
+            path = run_dir / f"{run_basename}_{filename}"
+            fig.savefig(path, dpi=300)
+            saved_paths.append(path)
+        figures.append(fig)
+
+    return figures, saved_paths
+
+
+def _write_metadata_file(run_dir, run_basename, metadata):
+    metadata_path = run_dir / f"{run_basename}_metadata.json"
+    with metadata_path.open("w", encoding="utf-8") as metadata_file:
+        json.dump(metadata, metadata_file, indent=2)
+    return metadata_path
 
 
 def SimulateRounds(
@@ -803,9 +1026,7 @@ def SimulateRounds(
     store_results = count <= store_results_threshold
     accumulator = _SimulationAccumulator(store_results=store_results)
 
-    def backend_runner(batch_size):
-        return _simulate_numba_backend(batch_size)
-
+    simulate_batch = _simulate_numba_backend
     run_label_template = "Numba parallel (threads={units})"
 
     start_time = time.time()
@@ -826,8 +1047,9 @@ def SimulateRounds(
             bonus_flags_chunk,
             _,
             units,
-        ) = backend_runner(batch_size)
+        ) = simulate_batch(batch_size)
         chunk_elapsed = time.time() - chunk_start
+
         accumulator.update(
             results,
             stats0_chunk,
@@ -840,67 +1062,44 @@ def SimulateRounds(
         processed += batch_size
         if units_value is None:
             units_value = units
+
+        progress_message = _format_progress_message(processed, count, batch_size, chunk_elapsed, start_time)
+        print(progress_message, flush=True)
+
         del results, stats0_chunk, stats1_chunk, stats2_chunk, yatzy_flags_chunk, bonus_flags_chunk
 
-        total_elapsed = time.time() - start_time
-        percent_complete = processed / count * 100.0
-        chunk_time_str = _format_elapsed(chunk_elapsed)
-        chunk_rate = batch_size / chunk_elapsed if chunk_elapsed > 0 else None
-        chunk_rate_str = (
-            f"{chunk_rate:,.0f} games/s" if chunk_rate is not None and math.isfinite(chunk_rate) else "n/a"
-        )
-        overall_rate = processed / total_elapsed if total_elapsed > 0 else None
-        overall_rate_str = (
-            f"{overall_rate:,.0f} games/s" if overall_rate is not None and math.isfinite(overall_rate) else "n/a"
-        )
-        remaining = count - processed
-        eta_seconds = None
-        if remaining > 0 and overall_rate is not None and math.isfinite(overall_rate) and overall_rate > 0:
-            eta_seconds = remaining / overall_rate
-        if remaining <= 0:
-            eta_message = "complete"
-        elif eta_seconds is not None and math.isfinite(eta_seconds):
-            eta_display = _format_duration(eta_seconds)
-            completion_str = _format_completion_timestamp(eta_seconds)
-            if completion_str:
-                eta_message = f"{eta_display} (finish ~ {completion_str})"
-            else:
-                eta_message = eta_display
-        else:
-            eta_message = "estimating..."
-
-        print(
-            (
-                f"Chunk complete: {processed:,}/{count:,} ({percent_complete:.2f}%) | "
-                f"chunk {batch_size:,} in {chunk_time_str} ({chunk_rate_str}) | "
-                f"overall {overall_rate_str} | ETA {eta_message}"
-            ),
-            flush=True,
-        )
-
-    end_time = time.time()
-    elapsed_ms = (end_time - start_time) * 1000.0
+    elapsed_ms = (time.time() - start_time) * 1000.0
     run_label = run_label_template.format(units=units_value if units_value is not None else "?")
 
     mean_val = float(accumulator.mean)
     std_val = float(accumulator.std)
-    bonus_probability = accumulator.total_bonus_hits / count * 100.0
-    yatzy_probability = accumulator.total_yatzy_hits / count * 100.0
-    yatzy_bonus_probability = accumulator.total_yatzy_and_bonus / count * 100.0
-    yatzy_no_bonus_probability = accumulator.total_yatzy_no_bonus / count * 100.0
-    no_yatzy_bonus_probability = accumulator.total_no_yatzy_bonus / count * 100.0
-    no_yatzy_no_bonus_probability = accumulator.total_no_yatzy_no_bonus / count * 100.0
+
+    probability_counts = {
+        "bonus": accumulator.total_bonus_hits,
+        "yatzy": accumulator.total_yatzy_hits,
+        "yatzy_bonus": accumulator.total_yatzy_and_bonus,
+        "yatzy_no_bonus": accumulator.total_yatzy_no_bonus,
+        "no_yatzy_bonus": accumulator.total_no_yatzy_bonus,
+        "no_yatzy_no_bonus": accumulator.total_no_yatzy_no_bonus,
+    }
+    probability_percent = {key: value / count * 100.0 for key, value in probability_counts.items()}
 
     print(f"\n--- RESULTS ({count} games across {run_label}) ---")
     print(f"\nTime: {elapsed_ms:.2f}ms")
     if not store_results or count > chunk_size:
         print(f"Processed in batches of {chunk_size} games (streaming aggregation).")
-    print(f"Bonus hit rate: {bonus_probability:.3f}% ({accumulator.total_bonus_hits}/{count})")
-    print(f"Yatzy hit rate: {yatzy_probability:.3f}% ({accumulator.total_yatzy_hits}/{count})")
-    print(f"Yatzy + Bonus rate: {yatzy_bonus_probability:.3f}% ({accumulator.total_yatzy_and_bonus}/{count})")
-    print(f"Yatzy without bonus rate: {yatzy_no_bonus_probability:.3f}% ({accumulator.total_yatzy_no_bonus}/{count})")
-    print(f"No Yatzy + Bonus rate: {no_yatzy_bonus_probability:.3f}% ({accumulator.total_no_yatzy_bonus}/{count})")
-    print(f"No Yatzy, No Bonus rate: {no_yatzy_no_bonus_probability:.3f}% ({accumulator.total_no_yatzy_no_bonus}/{count})")
+
+    for label, key in [
+        ("Bonus hit rate", "bonus"),
+        ("Yatzy hit rate", "yatzy"),
+        ("Yatzy + Bonus rate", "yatzy_bonus"),
+        ("Yatzy without bonus rate", "yatzy_no_bonus"),
+        ("No Yatzy + Bonus rate", "no_yatzy_bonus"),
+        ("No Yatzy, No Bonus rate", "no_yatzy_no_bonus"),
+    ]:
+        hits = probability_counts[key]
+        percent = probability_percent[key]
+        print(f"{label}: {percent:.3f}% ({hits}/{count})")
 
     if isinstance(histogram_bins, bool):
         raise ValueError("histogram_bins cannot be a boolean value")
@@ -911,311 +1110,51 @@ def SimulateRounds(
         if isinstance(histogram_bins_effective, (int, np.integer)) and histogram_bins_effective <= 0:
             raise ValueError("histogram_bins must be a positive integer when provided as an int")
 
-    if output_dir:
-        output_root = Path(output_dir)
-    else:
-        output_root = Path.cwd()
+    output_root = Path(output_dir) if output_dir else Path.cwd()
     output_root.mkdir(parents=True, exist_ok=True)
 
     run_basename = f"yatzy_{count}_{run_start_unix}"
     run_dir = output_root / run_basename
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    df = pd.DataFrame({
-        "Category": CATEGORY_NAMES,
-        "Roll0_count": accumulator.agg_stats0.tolist(),
-        "Roll1_count": accumulator.agg_stats1.tolist(),
-        "Roll2_count": accumulator.agg_stats2.tolist(),
-    })
-
-    df["Roll0_%"] = df["Roll0_count"] / (count * NUM_ROUNDS) * 100
-    df["Roll1_%"] = df["Roll1_count"] / (count * NUM_ROUNDS) * 100
-    df["Roll2_%"] = df["Roll2_count"] / (count * NUM_ROUNDS) * 100
-
-    summary = pd.DataFrame([
-        {"Category": "AverageScore", "Roll0_count": mean_val},
-        {"Category": "Std", "Roll0_count": std_val},
-        {"Category": "Bonus%", "Roll0_count": bonus_probability},
-        {"Category": "Yatzy%", "Roll0_count": yatzy_probability},
-        {"Category": "YatzyCount", "Roll0_count": accumulator.total_yatzy_hits},
-        {"Category": "BonusCount", "Roll0_count": accumulator.total_bonus_hits},
-        {"Category": "Yatzy+BonusCount", "Roll0_count": accumulator.total_yatzy_and_bonus},
-        {"Category": "Yatzy+Bonus%", "Roll0_count": yatzy_bonus_probability},
-        {"Category": "YatzyNoBonusCount", "Roll0_count": accumulator.total_yatzy_no_bonus},
-        {"Category": "YatzyNoBonus%", "Roll0_count": yatzy_no_bonus_probability},
-        {"Category": "NoYatzyBonusCount", "Roll0_count": accumulator.total_no_yatzy_bonus},
-        {"Category": "NoYatzyBonus%", "Roll0_count": no_yatzy_bonus_probability},
-        {"Category": "NoYatzyNoBonusCount", "Roll0_count": accumulator.total_no_yatzy_no_bonus},
-        {"Category": "NoYatzyNoBonus%", "Roll0_count": no_yatzy_no_bonus_probability},
-        {"Category": "ElapsedMs", "Roll0_count": elapsed_ms},
-    ])
-    summary_row_count = len(summary)
-    df = pd.concat([df, summary], ignore_index=True)
-
+    stats_df, summary_row_count = _build_stats_dataframe(accumulator, count, mean_val, std_val, elapsed_ms)
     data_slice = slice(None, -summary_row_count) if summary_row_count else slice(None)
 
     csv_path = run_dir / f"{run_basename}_stats.csv"
-    df.to_csv(csv_path, index=False)
+    stats_df.to_csv(csv_path, index=False)
     print(f"Exported results to: {csv_path}")
 
-    hist_values, hist_counts = accumulator.histogram_values()
-    (hist_values_yatzy, hist_counts_yatzy), (hist_values_no_yatzy, hist_counts_no_yatzy) = accumulator.histogram_values_by_yatzy()
-    (hist_values_bonus, hist_counts_bonus), (hist_values_no_bonus, hist_counts_no_bonus) = accumulator.histogram_values_by_bonus()
-    hist_combo_dict = accumulator.histogram_values_by_yatzy_and_bonus()
-    hist_values_yatzy_bonus, hist_counts_yatzy_bonus = hist_combo_dict[(True, True)]
-    hist_values_yatzy_no_bonus, hist_counts_yatzy_no_bonus = hist_combo_dict[(True, False)]
-    hist_values_no_yatzy_bonus, hist_counts_no_yatzy_bonus = hist_combo_dict[(False, True)]
-    hist_values_no_yatzy_no_bonus, hist_counts_no_yatzy_no_bonus = hist_combo_dict[(False, False)]
+    histogram_slices = _collect_histogram_slices(accumulator)
+    histogram_counts_map = accumulator.histogram_full_counts()
+    max_score = _max_observed_score(histogram_counts_map)
 
-    def _build_full_counts(values, counts, length):
-        expanded = np.zeros(length, dtype=np.int64)
-        if values.size:
-            indices = np.asarray(values, dtype=np.int64)
-            expanded[indices] = np.asarray(counts, dtype=np.int64)
-        return expanded
+    distribution_path = _write_distribution_csv(run_dir, run_basename, histogram_counts_map, max_score)
+    print(f"Saved consolidated distributions to: {distribution_path}")
 
-    max_score_candidates = []
-    if accumulator.max_score is not None:
-        max_score_candidates.append(int(accumulator.max_score))
-    for value_array in (
-        hist_values,
-        hist_values_yatzy,
-        hist_values_no_yatzy,
-        hist_values_bonus,
-        hist_values_no_bonus,
-        hist_values_yatzy_bonus,
-        hist_values_yatzy_no_bonus,
-        hist_values_no_yatzy_bonus,
-        hist_values_no_yatzy_no_bonus,
-    ):
-        if value_array.size:
-            max_score_candidates.append(int(value_array.max()))
-    max_score = max(max_score_candidates) if max_score_candidates else 0
-    if max_score < 0:
-        max_score = 0
-    score_length = max_score + 1
-
-    distribution_columns = [
-        (("Both", "Both"), (hist_values, hist_counts)),
-        (("Both", "Yes"), (hist_values_yatzy, hist_counts_yatzy)),
-        (("Both", "No"), (hist_values_no_yatzy, hist_counts_no_yatzy)),
-        (("Yes", "Both"), (hist_values_bonus, hist_counts_bonus)),
-        (("No", "Both"), (hist_values_no_bonus, hist_counts_no_bonus)),
-        (("Yes", "Yes"), (hist_values_yatzy_bonus, hist_counts_yatzy_bonus)),
-        (("Yes", "No"), (hist_values_no_yatzy_bonus, hist_counts_no_yatzy_bonus)),
-        (("No", "Yes"), (hist_values_yatzy_no_bonus, hist_counts_yatzy_no_bonus)),
-        (("No", "No"), (hist_values_no_yatzy_no_bonus, hist_counts_no_yatzy_no_bonus)),
-    ]
-
-    consolidated_counts = {
-        labels: _build_full_counts(values, counts, score_length)
-        for labels, (values, counts) in distribution_columns
-    }
-
-    consolidated_distribution_path = run_dir / f"{run_basename}_distributions.csv"
-    with consolidated_distribution_path.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.writer(csv_file)
-        writer.writerow(["Bonus?"] + [labels[0] for labels, _ in distribution_columns])
-        writer.writerow(["Yatzy?"] + [labels[1] for labels, _ in distribution_columns])
-        writer.writerow([f"Score (0-{max_score})"] + ["Count"] * len(distribution_columns))
-        for score in range(score_length):
-            writer.writerow([score] + [int(consolidated_counts[labels][score]) for labels, _ in distribution_columns])
-    print(f"Saved consolidated distributions to: {consolidated_distribution_path}")
-
-    results_array = accumulator.finalize_results()
-    yatzy_flags_array = accumulator.finalize_yatzy_flags()
-    bonus_flags_array = accumulator.finalize_bonus_flags()
-
-    if (
-        results_array is not None
-        and yatzy_flags_array is not None
-        and bonus_flags_array is not None
-        and results_array.size == yatzy_flags_array.size == bonus_flags_array.size
-    ):
-        yatzy_bool_store = np.asarray(yatzy_flags_array, dtype=np.bool_)
-        bonus_bool_store = np.asarray(bonus_flags_array, dtype=np.bool_)
-        results_array_yatzy = results_array[yatzy_bool_store]
-        results_array_no_yatzy = results_array[~yatzy_bool_store]
-        results_array_bonus = results_array[bonus_bool_store]
-        results_array_no_bonus = results_array[~bonus_bool_store]
-        combo_yatzy_bonus_mask = np.logical_and(yatzy_bool_store, bonus_bool_store)
-        combo_yatzy_no_bonus_mask = np.logical_and(yatzy_bool_store, ~bonus_bool_store)
-        combo_no_yatzy_bonus_mask = np.logical_and(~yatzy_bool_store, bonus_bool_store)
-        combo_no_yatzy_no_bonus_mask = np.logical_and(~yatzy_bool_store, ~bonus_bool_store)
-        results_array_yatzy_bonus = results_array[combo_yatzy_bonus_mask]
-        results_array_yatzy_no_bonus = results_array[combo_yatzy_no_bonus_mask]
-        results_array_no_yatzy_bonus = results_array[combo_no_yatzy_bonus_mask]
-        results_array_no_yatzy_no_bonus = results_array[combo_no_yatzy_no_bonus_mask]
-    else:
-        results_array_yatzy = None
-        results_array_no_yatzy = None
-        results_array_bonus = None
-        results_array_no_bonus = None
-        results_array_yatzy_bonus = None
-        results_array_yatzy_no_bonus = None
-        results_array_no_yatzy_bonus = None
-        results_array_no_yatzy_no_bonus = None
-
-    total_yatzy_games = int(hist_counts_yatzy.sum())
-    total_no_yatzy_games = int(hist_counts_no_yatzy.sum())
-    total_bonus_games = int(hist_counts_bonus.sum())
-    total_no_bonus_games = int(hist_counts_no_bonus.sum())
-    total_yatzy_bonus_games = int(hist_counts_yatzy_bonus.sum())
-    total_yatzy_no_bonus_games = int(hist_counts_yatzy_no_bonus.sum())
-    total_no_yatzy_bonus_games = int(hist_counts_no_yatzy_bonus.sum())
-    total_no_yatzy_no_bonus_games = int(hist_counts_no_yatzy_no_bonus.sum())
-
-    def _mean_from_hist(values, counts):
-        total = counts.sum()
-        if total == 0:
-            return None
-        return float(np.dot(values.astype(np.float64), counts.astype(np.float64)) / float(total))
-
-    mean_yatzy = _mean_from_hist(hist_values_yatzy, hist_counts_yatzy)
-    mean_no_yatzy = _mean_from_hist(hist_values_no_yatzy, hist_counts_no_yatzy)
-    mean_bonus = _mean_from_hist(hist_values_bonus, hist_counts_bonus)
-    mean_no_bonus = _mean_from_hist(hist_values_no_bonus, hist_counts_no_bonus)
-    mean_yatzy_bonus = _mean_from_hist(hist_values_yatzy_bonus, hist_counts_yatzy_bonus)
-    mean_yatzy_no_bonus = _mean_from_hist(hist_values_yatzy_no_bonus, hist_counts_yatzy_no_bonus)
-    mean_no_yatzy_bonus = _mean_from_hist(hist_values_no_yatzy_bonus, hist_counts_no_yatzy_bonus)
-    mean_no_yatzy_no_bonus = _mean_from_hist(hist_values_no_yatzy_no_bonus, hist_counts_no_yatzy_no_bonus)
+    stored_subsets = _extract_stored_subsets(accumulator)
+    results_array = stored_subsets.get("all")
 
     figures = []
     saved_plot_paths = []
 
-    fig_prob, ax_prob = plt.subplots(figsize=(10, 5))
-    categories_no_summary = df["Category"].iloc[data_slice]
-    x = np.arange(len(categories_no_summary))
-    width = 0.25
-
-    ax_prob.bar(x - width, df["Roll0_%"].iloc[data_slice], width, label="First roll")
-    ax_prob.bar(x, df["Roll1_%"].iloc[data_slice], width, label="Reroll 1")
-    ax_prob.bar(x + width, df["Roll2_%"].iloc[data_slice], width, label="Reroll 2")
-
-    ax_prob.set_title("Probability to satisfy category (initial roll to second reroll)")
-    ax_prob.set_xlabel("Yatzy category")
-    ax_prob.set_ylabel("Probability (%)")
-    ax_prob.set_xticks(x)
-    ax_prob.set_xticklabels(categories_no_summary.to_list(), rotation=45, ha="right")
-    ax_prob.legend()
-    ax_prob.grid(alpha=0.3, axis="y")
-    fig_prob.tight_layout()
-
-    if save_plots:
-        category_plot_path = run_dir / f"{run_basename}_category_probabilities.png"
-        fig_prob.savefig(category_plot_path, dpi=300)
-        saved_plot_paths.append(category_plot_path)
-        print(f"Saved category probability plot to: {category_plot_path}")
+    fig_prob, prob_path = _plot_category_probabilities(stats_df, data_slice, run_dir, run_basename, save_plots)
     figures.append(fig_prob)
+    if prob_path is not None:
+        saved_plot_paths.append(prob_path)
+        print(f"Saved category probability plot to: {prob_path}")
 
-    histogram_specs = [
-        (
-            "All games",
-            results_array,
-            hist_values,
-            hist_counts,
-            mean_val,
-            count,
-            "score_distribution.png",
-        ),
-        (
-            "Yatzy achieved",
-            results_array_yatzy,
-            hist_values_yatzy,
-            hist_counts_yatzy,
-            mean_yatzy,
-            total_yatzy_games,
-            "score_distribution_yatzy.png",
-        ),
-        (
-            "No Yatzy",
-            results_array_no_yatzy,
-            hist_values_no_yatzy,
-            hist_counts_no_yatzy,
-            mean_no_yatzy,
-            total_no_yatzy_games,
-            "score_distribution_no_yatzy.png",
-        ),
-        (
-            "Bonus achieved",
-            results_array_bonus,
-            hist_values_bonus,
-            hist_counts_bonus,
-            mean_bonus,
-            total_bonus_games,
-            "score_distribution_bonus.png",
-        ),
-        (
-            "No bonus",
-            results_array_no_bonus,
-            hist_values_no_bonus,
-            hist_counts_no_bonus,
-            mean_no_bonus,
-            total_no_bonus_games,
-            "score_distribution_no_bonus.png",
-        ),
-        (
-            "Yatzy + bonus",
-            results_array_yatzy_bonus,
-            hist_values_yatzy_bonus,
-            hist_counts_yatzy_bonus,
-            mean_yatzy_bonus,
-            total_yatzy_bonus_games,
-            "score_distribution_yatzy_bonus.png",
-        ),
-        (
-            "Yatzy without bonus",
-            results_array_yatzy_no_bonus,
-            hist_values_yatzy_no_bonus,
-            hist_counts_yatzy_no_bonus,
-            mean_yatzy_no_bonus,
-            total_yatzy_no_bonus_games,
-            "score_distribution_yatzy_no_bonus.png",
-        ),
-        (
-            "No Yatzy + bonus",
-            results_array_no_yatzy_bonus,
-            hist_values_no_yatzy_bonus,
-            hist_counts_no_yatzy_bonus,
-            mean_no_yatzy_bonus,
-            total_no_yatzy_bonus_games,
-            "score_distribution_no_yatzy_bonus.png",
-        ),
-        (
-            "No Yatzy + no bonus",
-            results_array_no_yatzy_no_bonus,
-            hist_values_no_yatzy_no_bonus,
-            hist_counts_no_yatzy_no_bonus,
-            mean_no_yatzy_no_bonus,
-            total_no_yatzy_no_bonus_games,
-            "score_distribution_no_yatzy_no_bonus.png",
-        ),
-    ]
-
-    for label, data_array, values_subset, counts_subset, mean_subset, subset_total, filename_suffix in histogram_specs:
-        fig_hist, ax_hist = plt.subplots(figsize=(8, 4))
-        if data_array is not None and data_array.size:
-            ax_hist.hist(data_array, bins=histogram_bins_effective, edgecolor="black", alpha=0.7)
-        elif counts_subset.size:
-            ax_hist.hist(values_subset, bins=histogram_bins_effective, weights=counts_subset, edgecolor="black", alpha=0.7)
-        else:
-            ax_hist.bar([0], [0], width=0.9, edgecolor="black", alpha=0.7)
-
-        if mean_subset is not None:
-            ax_hist.axvline(mean_subset, color="red", linestyle="--", linewidth=2, label=f"Mean = {mean_subset:.1f}")
-            ax_hist.legend()
-        ax_hist.set_title(f"Distribution of Yatzy scores ({label})")
-        ax_hist.set_xlabel("Points")
-        ax_hist.set_ylabel(f"Games (n={subset_total})")
-        ax_hist.grid(alpha=0.3)
-        fig_hist.tight_layout()
-
-        if save_plots:
-            histogram_plot_path = run_dir / f"{run_basename}_{filename_suffix}"
-            fig_hist.savefig(histogram_plot_path, dpi=300)
-            saved_plot_paths.append(histogram_plot_path)
-            print(f"Saved score distribution plot to: {histogram_plot_path}")
-        figures.append(fig_hist)
+    hist_figures, hist_paths = _plot_score_histograms(
+        run_dir,
+        run_basename,
+        histogram_bins_effective,
+        stored_subsets,
+        histogram_slices,
+        save_plots,
+    )
+    figures.extend(hist_figures)
+    for path in hist_paths:
+        saved_plot_paths.append(path)
+        print(f"Saved score distribution plot to: {path}")
 
     if show_plots:
         plt.show()
@@ -1225,8 +1164,6 @@ def SimulateRounds(
 
     if save_run_metadata:
         system_info = platform.uname()
-        metadata_path = run_dir / f"{run_basename}_metadata.json"
-        chunk_size_info = int(chunk_size) if chunk_size is not None else None
         finished_at_utc = datetime.fromtimestamp(
             start_time + elapsed_ms / 1000.0, tz=timezone.utc
         ).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -1235,22 +1172,22 @@ def SimulateRounds(
                 "count": int(count),
                 "run_label": run_label,
                 "numba_threads_used": int(units_value) if units_value is not None else None,
-                "chunk_size": chunk_size_info,
+                "chunk_size": int(chunk_size),
                 "store_results": bool(store_results),
                 "store_results_threshold": int(store_results_threshold),
-                "results_stored": bool(results_array is not None),
-                "bonus_probability_percent": bonus_probability,
-                "bonus_hits": int(accumulator.total_bonus_hits),
-                "yatzy_probability_percent": yatzy_probability,
-                "yatzy_hits": int(accumulator.total_yatzy_hits),
-                "yatzy_bonus_probability_percent": yatzy_bonus_probability,
-                "yatzy_bonus_hits": int(accumulator.total_yatzy_and_bonus),
-                "yatzy_no_bonus_probability_percent": yatzy_no_bonus_probability,
-                "yatzy_no_bonus_hits": int(accumulator.total_yatzy_no_bonus),
-                "no_yatzy_bonus_probability_percent": no_yatzy_bonus_probability,
-                "no_yatzy_bonus_hits": int(accumulator.total_no_yatzy_bonus),
-                "no_yatzy_no_bonus_probability_percent": no_yatzy_no_bonus_probability,
-                "no_yatzy_no_bonus_hits": int(accumulator.total_no_yatzy_no_bonus),
+                "results_stored": results_array is not None,
+                "bonus_probability_percent": probability_percent["bonus"],
+                "bonus_hits": int(probability_counts["bonus"]),
+                "yatzy_probability_percent": probability_percent["yatzy"],
+                "yatzy_hits": int(probability_counts["yatzy"]),
+                "yatzy_bonus_probability_percent": probability_percent["yatzy_bonus"],
+                "yatzy_bonus_hits": int(probability_counts["yatzy_bonus"]),
+                "yatzy_no_bonus_probability_percent": probability_percent["yatzy_no_bonus"],
+                "yatzy_no_bonus_hits": int(probability_counts["yatzy_no_bonus"]),
+                "no_yatzy_bonus_probability_percent": probability_percent["no_yatzy_bonus"],
+                "no_yatzy_bonus_hits": int(probability_counts["no_yatzy_bonus"]),
+                "no_yatzy_no_bonus_probability_percent": probability_percent["no_yatzy_no_bonus"],
+                "no_yatzy_no_bonus_hits": int(probability_counts["no_yatzy_no_bonus"]),
                 "average_score": mean_val,
                 "std_dev": std_val,
                 "histogram_bins_requested": histogram_bins,
@@ -1281,12 +1218,11 @@ def SimulateRounds(
             },
             "artifacts": {
                 "stats_csv": str(csv_path),
-                "distribution_csv": str(consolidated_distribution_path),
+                "distribution_csv": str(distribution_path),
                 "plots": [str(path) for path in saved_plot_paths],
             },
         }
-        with metadata_path.open("w", encoding="utf-8") as metadata_file:
-            json.dump(metadata, metadata_file, indent=2)
+        metadata_path = _write_metadata_file(run_dir, run_basename, metadata)
         print(f"Saved metadata to: {metadata_path}")
 
     print(f"Artifacts saved under: {run_dir}")
