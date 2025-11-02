@@ -6,10 +6,12 @@ import os
 import platform
 import shutil
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from itertools import product
 from pathlib import Path
 import sys
+from typing import Dict, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -82,6 +84,91 @@ CATEGORY_PRIORITY = np.array([
     CATEGORY_INDEX["FullHouse"],
     CATEGORY_INDEX["Chance"],
 ], dtype=np.int8)
+
+HistogramBins = Union[int, str, None]
+NUMBA_RUN_LABEL_TEMPLATE = "Numba parallel (threads={units})"
+
+
+## --- DATA MODELS ---
+
+
+@dataclass(frozen=True)
+class SimulationConfig:
+    count: int
+    chunk_size: int
+    store_results_threshold: int
+    output_dir: Path
+    histogram_bins: HistogramBins
+    save_plots: bool
+    show_plots: bool
+    save_run_metadata: bool
+
+    @classmethod
+    def from_inputs(
+        cls,
+        count,
+        chunk_size,
+        store_results_threshold,
+        output_dir,
+        histogram_bins,
+        save_plots,
+        show_plots,
+        save_run_metadata,
+    ) -> "SimulationConfig":
+        count_int = int(count)
+        if count_int <= 0:
+            raise ValueError("count must be a positive integer")
+        if not NUMBA_AVAILABLE:
+            raise RuntimeError("Numba is required for simulation but is not available.")
+
+        if chunk_size is None:
+            chunk_size_value = min(count_int, 10_000_000)
+        else:
+            chunk_size_value = int(chunk_size)
+        if chunk_size_value <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+
+        chunk_size_value = max(1, min(chunk_size_value, count_int))
+
+        threshold_int = int(store_results_threshold)
+        output_path = Path(output_dir) if output_dir else Path.cwd()
+
+        return cls(
+            count=count_int,
+            chunk_size=chunk_size_value,
+            store_results_threshold=threshold_int,
+            output_dir=output_path,
+            histogram_bins=histogram_bins,
+            save_plots=bool(save_plots),
+            show_plots=bool(show_plots),
+            save_run_metadata=bool(save_run_metadata),
+        )
+
+    @property
+    def store_results(self) -> bool:
+        return self.count <= self.store_results_threshold
+
+
+@dataclass(frozen=True)
+class SimulationSummary:
+    count: int
+    chunk_size: int
+    store_results: bool
+    elapsed_ms: float
+    mean: float
+    std: float
+    probability_counts: Dict[str, int]
+    probability_percent: Dict[str, float]
+    histogram_bins_requested: HistogramBins
+    histogram_bins_effective: Union[int, str]
+    run_label: str
+    units_value: Optional[int]
+    start_time: float
+    run_start_unix: int
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return self.elapsed_ms / 1000.0
 
 
 ## --- HELPERS ---
@@ -780,6 +867,15 @@ class _SimulationAccumulator:
         return {key: self._histograms.copy_counts(key) for key in _HISTOGRAM_KEYS}
 
 
+@dataclass
+class SimulationRunData:
+    accumulator: "_SimulationAccumulator"
+    elapsed_ms: float
+    units_value: Optional[int]
+    start_time: float
+    run_start_unix: int
+
+
 def _format_eta_message(remaining, overall_rate):
     if remaining <= 0:
         return "complete"
@@ -994,48 +1090,27 @@ def _plot_score_histograms(
     return figures, saved_paths
 
 
-def _write_metadata_file(run_dir, run_basename, metadata):
-    metadata_path = run_dir / f"{run_basename}_metadata.json"
-    with metadata_path.open("w", encoding="utf-8") as metadata_file:
-        json.dump(metadata, metadata_file, indent=2)
-    return metadata_path
+def _resolve_histogram_bins(histogram_bins: HistogramBins):
+    if isinstance(histogram_bins, bool):
+        raise ValueError("histogram_bins cannot be a boolean value")
+    if histogram_bins is None:
+        return "auto"
+    if isinstance(histogram_bins, (int, np.integer)):
+        if int(histogram_bins) <= 0:
+            raise ValueError("histogram_bins must be a positive integer when provided as an int")
+        return int(histogram_bins)
+    return histogram_bins
 
 
-def SimulateRounds(
-    count,
-    chunk_size=None,
-    store_results_threshold=1_000_000_000,
-    output_dir="results",
-    histogram_bins=20,
-    save_plots=True,
-    show_plots=False,
-    save_run_metadata=True,
-):
-    if count <= 0:
-        raise ValueError("count must be a positive integer")
-
-    if not NUMBA_AVAILABLE:
-        raise RuntimeError("Numba is required for simulation but is not available.")
-
-    if chunk_size is None:
-        chunk_size = min(count, 10_000_000)
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be a positive integer")
-    chunk_size = max(1, min(chunk_size, count))
-
-    store_results = count <= store_results_threshold
-    accumulator = _SimulationAccumulator(store_results=store_results)
-
-    simulate_batch = _simulate_numba_backend
-    run_label_template = "Numba parallel (threads={units})"
-
+def _run_simulation_loop(config: SimulationConfig) -> SimulationRunData:
+    accumulator = _SimulationAccumulator(store_results=config.store_results)
     start_time = time.time()
     run_start_unix = int(start_time)
     processed = 0
-    units_value = None
+    units_value: Optional[int] = None
 
-    while processed < count:
-        batch_size = min(chunk_size, count - processed)
+    while processed < config.count:
+        batch_size = min(config.chunk_size, config.count - processed)
         chunk_start = time.time()
         (
             results,
@@ -1047,7 +1122,7 @@ def SimulateRounds(
             bonus_flags_chunk,
             _,
             units,
-        ) = simulate_batch(batch_size)
+        ) = _simulate_numba_backend(batch_size)
         chunk_elapsed = time.time() - chunk_start
 
         accumulator.update(
@@ -1063,14 +1138,29 @@ def SimulateRounds(
         if units_value is None:
             units_value = units
 
-        progress_message = _format_progress_message(processed, count, batch_size, chunk_elapsed, start_time)
+        progress_message = _format_progress_message(
+            processed,
+            config.count,
+            batch_size,
+            chunk_elapsed,
+            start_time,
+        )
         print(progress_message, flush=True)
 
         del results, stats0_chunk, stats1_chunk, stats2_chunk, yatzy_flags_chunk, bonus_flags_chunk
 
     elapsed_ms = (time.time() - start_time) * 1000.0
-    run_label = run_label_template.format(units=units_value if units_value is not None else "?")
+    return SimulationRunData(
+        accumulator=accumulator,
+        elapsed_ms=elapsed_ms,
+        units_value=units_value,
+        start_time=start_time,
+        run_start_unix=run_start_unix,
+    )
 
+
+def _summarize_run(config: SimulationConfig, run_data: SimulationRunData) -> SimulationSummary:
+    accumulator = run_data.accumulator
     mean_val = float(accumulator.mean)
     std_val = float(accumulator.std)
 
@@ -1082,12 +1172,34 @@ def SimulateRounds(
         "no_yatzy_bonus": accumulator.total_no_yatzy_bonus,
         "no_yatzy_no_bonus": accumulator.total_no_yatzy_no_bonus,
     }
-    probability_percent = {key: value / count * 100.0 for key, value in probability_counts.items()}
+    probability_percent = {key: value / config.count * 100.0 for key, value in probability_counts.items()}
 
-    print(f"\n--- RESULTS ({count} games across {run_label}) ---")
-    print(f"\nTime: {elapsed_ms:.2f}ms")
-    if not store_results or count > chunk_size:
-        print(f"Processed in batches of {chunk_size} games (streaming aggregation).")
+    histogram_bins_effective = _resolve_histogram_bins(config.histogram_bins)
+    run_label = NUMBA_RUN_LABEL_TEMPLATE.format(units=run_data.units_value if run_data.units_value is not None else "?")
+
+    return SimulationSummary(
+        count=config.count,
+        chunk_size=config.chunk_size,
+        store_results=config.store_results,
+        elapsed_ms=run_data.elapsed_ms,
+        mean=mean_val,
+        std=std_val,
+        probability_counts=probability_counts,
+        probability_percent=probability_percent,
+        histogram_bins_requested=config.histogram_bins,
+        histogram_bins_effective=histogram_bins_effective,
+        run_label=run_label,
+        units_value=run_data.units_value,
+        start_time=run_data.start_time,
+        run_start_unix=run_data.run_start_unix,
+    )
+
+
+def _print_run_summary(summary: SimulationSummary):
+    print(f"\n--- RESULTS ({summary.count} games across {summary.run_label}) ---")
+    print(f"\nTime: {summary.elapsed_ms:.2f}ms")
+    if not summary.store_results or summary.count > summary.chunk_size:
+        print(f"Processed in batches of {summary.chunk_size} games (streaming aggregation).")
 
     for label, key in [
         ("Bonus hit rate", "bonus"),
@@ -1097,27 +1209,31 @@ def SimulateRounds(
         ("No Yatzy + Bonus rate", "no_yatzy_bonus"),
         ("No Yatzy, No Bonus rate", "no_yatzy_no_bonus"),
     ]:
-        hits = probability_counts[key]
-        percent = probability_percent[key]
-        print(f"{label}: {percent:.3f}% ({hits}/{count})")
+        hits = summary.probability_counts[key]
+        percent = summary.probability_percent[key]
+        print(f"{label}: {percent:.3f}% ({hits}/{summary.count})")
 
-    if isinstance(histogram_bins, bool):
-        raise ValueError("histogram_bins cannot be a boolean value")
-    if histogram_bins is None:
-        histogram_bins_effective = "auto"
-    else:
-        histogram_bins_effective = histogram_bins
-        if isinstance(histogram_bins_effective, (int, np.integer)) and histogram_bins_effective <= 0:
-            raise ValueError("histogram_bins must be a positive integer when provided as an int")
 
-    output_root = Path(output_dir) if output_dir else Path.cwd()
+def _export_run_artifacts(
+    config: SimulationConfig,
+    summary: SimulationSummary,
+    run_data: SimulationRunData,
+):
+    output_root = config.output_dir if config.output_dir else Path.cwd()
     output_root.mkdir(parents=True, exist_ok=True)
 
-    run_basename = f"yatzy_{count}_{run_start_unix}"
+    run_basename = f"yatzy_{summary.count}_{summary.run_start_unix}"
     run_dir = output_root / run_basename
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    stats_df, summary_row_count = _build_stats_dataframe(accumulator, count, mean_val, std_val, elapsed_ms)
+    accumulator = run_data.accumulator
+    stats_df, summary_row_count = _build_stats_dataframe(
+        accumulator,
+        summary.count,
+        summary.mean,
+        summary.std,
+        summary.elapsed_ms,
+    )
     data_slice = slice(None, -summary_row_count) if summary_row_count else slice(None)
 
     csv_path = run_dir / f"{run_basename}_stats.csv"
@@ -1137,7 +1253,13 @@ def SimulateRounds(
     figures = []
     saved_plot_paths = []
 
-    fig_prob, prob_path = _plot_category_probabilities(stats_df, data_slice, run_dir, run_basename, save_plots)
+    fig_prob, prob_path = _plot_category_probabilities(
+        stats_df,
+        data_slice,
+        run_dir,
+        run_basename,
+        config.save_plots,
+    )
     figures.append(fig_prob)
     if prob_path is not None:
         saved_plot_paths.append(prob_path)
@@ -1146,86 +1268,145 @@ def SimulateRounds(
     hist_figures, hist_paths = _plot_score_histograms(
         run_dir,
         run_basename,
-        histogram_bins_effective,
+        summary.histogram_bins_effective,
         stored_subsets,
         histogram_slices,
-        save_plots,
+        config.save_plots,
     )
     figures.extend(hist_figures)
     for path in hist_paths:
         saved_plot_paths.append(path)
         print(f"Saved score distribution plot to: {path}")
 
-    if show_plots:
+    if config.show_plots:
         plt.show()
     else:
         for fig in figures:
             plt.close(fig)
 
-    if save_run_metadata:
-        system_info = platform.uname()
-        finished_at_utc = datetime.fromtimestamp(
-            start_time + elapsed_ms / 1000.0, tz=timezone.utc
-        ).isoformat(timespec="seconds").replace("+00:00", "Z")
-        metadata = {
-            "run": {
-                "count": int(count),
-                "run_label": run_label,
-                "numba_threads_used": int(units_value) if units_value is not None else None,
-                "chunk_size": int(chunk_size),
-                "store_results": bool(store_results),
-                "store_results_threshold": int(store_results_threshold),
-                "results_stored": results_array is not None,
-                "bonus_probability_percent": probability_percent["bonus"],
-                "bonus_hits": int(probability_counts["bonus"]),
-                "yatzy_probability_percent": probability_percent["yatzy"],
-                "yatzy_hits": int(probability_counts["yatzy"]),
-                "yatzy_bonus_probability_percent": probability_percent["yatzy_bonus"],
-                "yatzy_bonus_hits": int(probability_counts["yatzy_bonus"]),
-                "yatzy_no_bonus_probability_percent": probability_percent["yatzy_no_bonus"],
-                "yatzy_no_bonus_hits": int(probability_counts["yatzy_no_bonus"]),
-                "no_yatzy_bonus_probability_percent": probability_percent["no_yatzy_bonus"],
-                "no_yatzy_bonus_hits": int(probability_counts["no_yatzy_bonus"]),
-                "no_yatzy_no_bonus_probability_percent": probability_percent["no_yatzy_no_bonus"],
-                "no_yatzy_no_bonus_hits": int(probability_counts["no_yatzy_no_bonus"]),
-                "average_score": mean_val,
-                "std_dev": std_val,
-                "histogram_bins_requested": histogram_bins,
-                "histogram_bins_effective": histogram_bins_effective,
-                "elapsed_ms": elapsed_ms,
-                "output_directory": str(run_dir),
-                "run_timestamp_unix": run_start_unix,
-            },
-            "timing": {
-                "started_at_utc": datetime.fromtimestamp(
-                    start_time, tz=timezone.utc
-                ).isoformat(timespec="seconds").replace("+00:00", "Z"),
-                "finished_at_utc": finished_at_utc,
-                "elapsed_ms": elapsed_ms,
-                "elapsed_seconds": elapsed_ms / 1000.0,
-            },
-            "system": {
-                "platform": system_info.system,
-                "platform_release": system_info.release,
-                "platform_version": system_info.version,
-                "machine": system_info.machine,
-                "processor": system_info.processor,
-                "python_version": platform.python_version(),
-                "python_implementation": platform.python_implementation(),
-                "python_executable": sys.executable,
-                "cpu_count": os.cpu_count(),
-                "numba_available": NUMBA_AVAILABLE,
-            },
-            "artifacts": {
-                "stats_csv": str(csv_path),
-                "distribution_csv": str(distribution_path),
-                "plots": [str(path) for path in saved_plot_paths],
-            },
-        }
-        metadata_path = _write_metadata_file(run_dir, run_basename, metadata)
+    return {
+        "run_dir": run_dir,
+        "run_basename": run_basename,
+        "csv_path": csv_path,
+        "distribution_path": distribution_path,
+        "saved_plot_paths": saved_plot_paths,
+        "results_array": results_array,
+    }
+
+
+def _write_metadata_file(run_dir, run_basename, metadata):
+    metadata_path = run_dir / f"{run_basename}_metadata.json"
+    with metadata_path.open("w", encoding="utf-8") as metadata_file:
+        json.dump(metadata, metadata_file, indent=2)
+    return metadata_path
+
+
+def _write_run_metadata(
+    config: SimulationConfig,
+    summary: SimulationSummary,
+    artifact_info,
+):
+    system_info = platform.uname()
+    finished_at_utc = datetime.fromtimestamp(
+        summary.start_time + summary.elapsed_seconds,
+        tz=timezone.utc,
+    ).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    probability_percent = summary.probability_percent
+    probability_counts = summary.probability_counts
+    results_array = artifact_info["results_array"]
+
+    metadata = {
+        "run": {
+            "count": int(summary.count),
+            "run_label": summary.run_label,
+            "numba_threads_used": int(summary.units_value) if summary.units_value is not None else None,
+            "chunk_size": int(summary.chunk_size),
+            "store_results": bool(summary.store_results),
+            "store_results_threshold": int(config.store_results_threshold),
+            "results_stored": results_array is not None,
+            "bonus_probability_percent": probability_percent["bonus"],
+            "bonus_hits": int(probability_counts["bonus"]),
+            "yatzy_probability_percent": probability_percent["yatzy"],
+            "yatzy_hits": int(probability_counts["yatzy"]),
+            "yatzy_bonus_probability_percent": probability_percent["yatzy_bonus"],
+            "yatzy_bonus_hits": int(probability_counts["yatzy_bonus"]),
+            "yatzy_no_bonus_probability_percent": probability_percent["yatzy_no_bonus"],
+            "yatzy_no_bonus_hits": int(probability_counts["yatzy_no_bonus"]),
+            "no_yatzy_bonus_probability_percent": probability_percent["no_yatzy_bonus"],
+            "no_yatzy_bonus_hits": int(probability_counts["no_yatzy_bonus"]),
+            "no_yatzy_no_bonus_probability_percent": probability_percent["no_yatzy_no_bonus"],
+            "no_yatzy_no_bonus_hits": int(probability_counts["no_yatzy_no_bonus"]),
+            "average_score": summary.mean,
+            "std_dev": summary.std,
+            "histogram_bins_requested": summary.histogram_bins_requested,
+            "histogram_bins_effective": summary.histogram_bins_effective,
+            "elapsed_ms": summary.elapsed_ms,
+            "output_directory": str(artifact_info["run_dir"]),
+            "run_timestamp_unix": int(summary.run_start_unix),
+        },
+        "timing": {
+            "started_at_utc": datetime.fromtimestamp(
+                summary.start_time,
+                tz=timezone.utc,
+            ).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "finished_at_utc": finished_at_utc,
+            "elapsed_ms": summary.elapsed_ms,
+            "elapsed_seconds": summary.elapsed_seconds,
+        },
+        "system": {
+            "platform": system_info.system,
+            "platform_release": system_info.release,
+            "platform_version": system_info.version,
+            "machine": system_info.machine,
+            "processor": system_info.processor,
+            "python_version": platform.python_version(),
+            "python_implementation": platform.python_implementation(),
+            "python_executable": sys.executable,
+            "cpu_count": os.cpu_count(),
+            "numba_available": NUMBA_AVAILABLE,
+        },
+        "artifacts": {
+            "stats_csv": str(artifact_info["csv_path"]),
+            "distribution_csv": str(artifact_info["distribution_path"]),
+            "plots": [str(path) for path in artifact_info["saved_plot_paths"]],
+        },
+    }
+    return _write_metadata_file(artifact_info["run_dir"], artifact_info["run_basename"], metadata)
+
+
+def SimulateRounds(
+    count,
+    chunk_size=None,
+    store_results_threshold=1_000_000_000,
+    output_dir="results",
+    histogram_bins=20,
+    save_plots=True,
+    show_plots=False,
+    save_run_metadata=True,
+):
+    config = SimulationConfig.from_inputs(
+        count=count,
+        chunk_size=chunk_size,
+        store_results_threshold=store_results_threshold,
+        output_dir=output_dir,
+        histogram_bins=histogram_bins,
+        save_plots=save_plots,
+        show_plots=show_plots,
+        save_run_metadata=save_run_metadata,
+    )
+
+    run_data = _run_simulation_loop(config)
+    summary = _summarize_run(config, run_data)
+    _print_run_summary(summary)
+
+    artifact_info = _export_run_artifacts(config, summary, run_data)
+
+    if config.save_run_metadata:
+        metadata_path = _write_run_metadata(config, summary, artifact_info)
         print(f"Saved metadata to: {metadata_path}")
 
-    print(f"Artifacts saved under: {run_dir}")
+    print(f"Artifacts saved under: {artifact_info['run_dir']}")
 
 
 def _parse_positive_int(value):
