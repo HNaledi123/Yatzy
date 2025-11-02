@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 from itertools import product
 from pathlib import Path
 import sys
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
