@@ -7,7 +7,6 @@ import platform
 import shutil
 import time
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ProcessPoolExecutor
 from itertools import product
 from pathlib import Path
 import sys
@@ -32,21 +31,6 @@ except Exception:  # NumPy/Numba incompatibility or missing package
     nb_int8 = int  # type: ignore
     nb_boolean = bool  # type: ignore
 
-if NUMBA_AVAILABLE:
-    try:
-        from numba import cuda
-        from numba.cuda.random import create_xoroshiro128p_states, xoroshiro128p_uniform_float32
-        CUDA_AVAILABLE = cuda.is_available()
-    except Exception:  # CUDA toolchain missing or driver unavailable
-        cuda = None  # type: ignore
-        create_xoroshiro128p_states = None  # type: ignore
-        xoroshiro128p_uniform_float32 = None  # type: ignore
-        CUDA_AVAILABLE = False
-else:
-    CUDA_AVAILABLE = False
-    cuda = None  # type: ignore
-    create_xoroshiro128p_states = None  # type: ignore
-    xoroshiro128p_uniform_float32 = None  # type: ignore
 
 ## --- CONFIGURATION ---
 debug = False
@@ -455,109 +439,6 @@ if NUMBA_AVAILABLE:
         return results, bonus_flags, stats0_all, stats1_all, stats2_all, yatzy_hits
 
 
-if CUDA_AVAILABLE:
-    CATEGORY_PRIORITY_CUDA = CATEGORY_PRIORITY.astype(np.int16)
-
-    @cuda.jit(device=True)
-    def _encode_roll_cuda(dice_array):
-        key = 0
-        for i in range(5):
-            key = key * 6 + (int(dice_array[i]) - 1)
-        return key
-
-    @cuda.jit(device=True)
-    def _roll_die_cuda(rng_states, thread_id):
-        val = int(xoroshiro128p_uniform_float32(rng_states, thread_id) * 6.0)
-        if val >= 6:
-            val = 5
-        return val + 1
-
-    @cuda.jit
-    def _simulate_kernel_cuda(rng_states, results, bonus_hits, yatzy_hits, stats0_all, stats1_all, stats2_all,
-                              roll_score_table, roll_sat_matrix, roll_keep_value, roll_keep_count, category_priority,
-                              yatzy_category_index):
-        idx = cuda.grid(1)
-        if idx >= results.shape[0]:
-            return
-
-        stats0_local = cuda.local.array(NUM_CATEGORIES, nb_int32)
-        stats1_local = cuda.local.array(NUM_CATEGORIES, nb_int32)
-        stats2_local = cuda.local.array(NUM_CATEGORIES, nb_int32)
-        allowed_mask_local = cuda.local.array(NUM_CATEGORIES, nb_boolean)
-        dice0 = cuda.local.array(5, nb_int8)
-        dice1 = cuda.local.array(5, nb_int8)
-        dice2 = cuda.local.array(5, nb_int8)
-
-        for c in range(NUM_CATEGORIES):
-            stats0_local[c] = 0
-            stats1_local[c] = 0
-            stats2_local[c] = 0
-            allowed_mask_local[c] = True
-
-        total_points = 0
-        upper_points = 0
-        got_yatzy = False
-
-        for _ in range(NUM_ROUNDS):
-            for j in range(5):
-                dice0[j] = _roll_die_cuda(rng_states, idx)
-            idx0 = _encode_roll_cuda(dice0)
-            row0 = roll_sat_matrix[idx0]
-            for c in range(NUM_CATEGORIES):
-                stats0_local[c] += int(row0[c])
-
-            keep_count0 = int(roll_keep_count[idx0])
-            keep_value0 = int(roll_keep_value[idx0])
-            for j in range(keep_count0):
-                dice1[j] = keep_value0
-            for j in range(keep_count0, 5):
-                dice1[j] = _roll_die_cuda(rng_states, idx)
-            idx1 = _encode_roll_cuda(dice1)
-            row1 = roll_sat_matrix[idx1]
-            for c in range(NUM_CATEGORIES):
-                stats1_local[c] += int(row1[c])
-
-            keep_count1 = int(roll_keep_count[idx1])
-            keep_value1 = int(roll_keep_value[idx1])
-            for j in range(keep_count1):
-                dice2[j] = keep_value1
-            for j in range(keep_count1, 5):
-                dice2[j] = _roll_die_cuda(rng_states, idx)
-            idx2 = _encode_roll_cuda(dice2)
-            row2 = roll_sat_matrix[idx2]
-            for c in range(NUM_CATEGORIES):
-                stats2_local[c] += int(row2[c])
-
-            best_score = -1
-            best_idx = 0
-            for j in range(NUM_CATEGORIES):
-                cat_idx = int(category_priority[j])
-                if not allowed_mask_local[cat_idx]:
-                    continue
-                score = int(roll_score_table[idx2, cat_idx])
-                if score > best_score:
-                    best_score = score
-                    best_idx = cat_idx
-
-            total_points += best_score
-            if best_idx < 6:
-                upper_points += best_score
-            if best_idx == yatzy_category_index and best_score > 0:
-                got_yatzy = True
-            allowed_mask_local[best_idx] = False
-
-        bonus = 50 if upper_points >= 63 else 0
-        total_points += bonus
-
-        results[idx] = total_points
-        bonus_hits[idx] = 1 if bonus > 0 else 0
-        yatzy_hits[idx] = 1 if got_yatzy else 0
-        for c in range(NUM_CATEGORIES):
-            stats0_all[idx, c] = stats0_local[c]
-            stats1_all[idx, c] = stats1_local[c]
-            stats2_all[idx, c] = stats2_local[c]
-
-
 ## --- MAIN GAMEPLAY ---
 
 def PlayYatzy(rng=None, stats0=None, stats1=None, stats2=None, allowed_mask=None):
@@ -629,81 +510,6 @@ def PlayYatzy(rng=None, stats0=None, stats1=None, stats2=None, allowed_mask=None
     return total_points, bonus > 0, got_yatzy
 
 
-def _simulate_chunk(task):
-    count, seed = task
-    rng = np.random.default_rng(seed)
-
-    results = np.empty(count, dtype=np.int32)
-    bonus_hits = 0
-    yatzy_flags = np.empty(count, dtype=np.uint8)
-    bonus_flags = np.empty(count, dtype=np.uint8)
-    agg_stats0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    agg_stats1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    agg_stats2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    tmp_stats0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    tmp_stats1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    tmp_stats2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    allowed_mask = np.empty(NUM_CATEGORIES, dtype=bool)
-
-    for i in range(count):
-        points, got_bonus, got_yatzy = PlayYatzy(rng, tmp_stats0, tmp_stats1, tmp_stats2, allowed_mask)
-        results[i] = points
-        if got_bonus:
-            bonus_hits += 1
-        yatzy_flags[i] = 1 if got_yatzy else 0
-        bonus_flags[i] = 1 if got_bonus else 0
-        agg_stats0 += tmp_stats0
-        agg_stats1 += tmp_stats1
-        agg_stats2 += tmp_stats2
-
-    return results, bonus_hits, agg_stats0, agg_stats1, agg_stats2, yatzy_flags, bonus_flags
-
-
-def _simulate_python_backend(count, processes):
-    available_cpus = os.cpu_count() or 1
-    if processes is None:
-        processes = min(available_cpus, count)
-    else:
-        processes = max(1, min(processes, available_cpus, count))
-
-    base, extra = divmod(count, processes)
-    chunk_sizes = [base + (1 if i < extra else 0) for i in range(processes)]
-    chunk_sizes = [size for size in chunk_sizes if size > 0]
-
-    seed_sequence = np.random.SeedSequence()
-    child_seeds = seed_sequence.spawn(len(chunk_sizes))
-    tasks = [(size, int(seed.generate_state(1)[0])) for size, seed in zip(chunk_sizes, child_seeds)]
-
-    start = time.time()
-    if len(tasks) == 1:
-        chunk_results = [_simulate_chunk(tasks[0])]
-    else:
-        with ProcessPoolExecutor(max_workers=processes) as pool:
-            chunk_results = list(pool.map(_simulate_chunk, tasks))
-    elapsed_ms = (time.time() - start) * 1000
-
-    agg_stats0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    agg_stats1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    agg_stats2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    results = np.empty(count, dtype=np.int32)
-    yatzy_flags = np.empty(count, dtype=np.uint8)
-    bonus_flags = np.empty(count, dtype=np.uint8)
-    bonus_hits = 0
-    offset = 0
-    for (scores, chunk_bonus, s0, s1, s2, chunk_yatzy, chunk_bonus_flags), size in zip(chunk_results, chunk_sizes):
-        end = offset + size
-        results[offset:end] = scores
-        yatzy_flags[offset:end] = chunk_yatzy
-        bonus_flags[offset:end] = chunk_bonus_flags
-        offset = end
-        bonus_hits += chunk_bonus
-        agg_stats0 += s0
-        agg_stats1 += s1
-        agg_stats2 += s2
-
-    return results, bonus_hits, agg_stats0, agg_stats1, agg_stats2, yatzy_flags, bonus_flags, elapsed_ms, processes
-
-
 def _simulate_numba_backend(count):
     if not NUMBA_AVAILABLE:
         raise RuntimeError("Numba backend requested but numba is not available.")
@@ -730,77 +536,6 @@ def _simulate_numba_backend(count):
         bonus_flags_array.astype(np.uint8),
         elapsed_ms,
         get_num_threads(),
-    )
-
-
-def _simulate_cuda_backend(count, threads_per_block=128):
-    if not CUDA_AVAILABLE:
-        raise RuntimeError("CUDA backend requested but CUDA is not available.")
-
-    if threads_per_block <= 0:
-        raise ValueError("threads_per_block must be a positive integer")
-
-    blocks_per_grid = (count + threads_per_block - 1) // threads_per_block
-    total_threads = blocks_per_grid * threads_per_block
-
-    roll_score_table_dev = cuda.to_device(ROLL_SCORE_TABLE.astype(np.int16))
-    roll_sat_matrix_dev = cuda.to_device(ROLL_SAT_MATRIX.astype(np.uint8))
-    roll_keep_value_dev = cuda.to_device(ROLL_KEEP_VALUE.astype(np.int8))
-    roll_keep_count_dev = cuda.to_device(ROLL_KEEP_COUNT.astype(np.uint8))
-    category_priority_dev = cuda.to_device(CATEGORY_PRIORITY_CUDA)
-
-    results_dev = cuda.device_array(count, dtype=np.int32)
-    bonus_hits_dev = cuda.device_array(count, dtype=np.uint8)
-    yatzy_hits_dev = cuda.device_array(count, dtype=np.uint8)
-    stats0_dev = cuda.device_array((count, NUM_CATEGORIES), dtype=np.int32)
-    stats1_dev = cuda.device_array((count, NUM_CATEGORIES), dtype=np.int32)
-    stats2_dev = cuda.device_array((count, NUM_CATEGORIES), dtype=np.int32)
-
-    seed_sequence = np.random.SeedSequence()
-    seed = int(seed_sequence.generate_state(1)[0])
-    rng_states = create_xoroshiro128p_states(total_threads, seed=seed)
-
-    start = time.time()
-    _simulate_kernel_cuda[blocks_per_grid, threads_per_block](
-        rng_states,
-        results_dev,
-        bonus_hits_dev,
-        yatzy_hits_dev,
-        stats0_dev,
-        stats1_dev,
-        stats2_dev,
-        roll_score_table_dev,
-        roll_sat_matrix_dev,
-        roll_keep_value_dev,
-        roll_keep_count_dev,
-        category_priority_dev,
-        np.int16(YATZY_CATEGORY_INDEX),
-    )
-    cuda.synchronize()
-    elapsed_ms = (time.time() - start) * 1000
-
-    results = results_dev.copy_to_host()
-    bonus_flags_array = bonus_hits_dev.copy_to_host()
-    yatzy_hits_array = yatzy_hits_dev.copy_to_host()
-    stats0_all = stats0_dev.copy_to_host()
-    stats1_all = stats1_dev.copy_to_host()
-    stats2_all = stats2_dev.copy_to_host()
-
-    agg_stats0 = stats0_all.sum(axis=0, dtype=np.int64)
-    agg_stats1 = stats1_all.sum(axis=0, dtype=np.int64)
-    agg_stats2 = stats2_all.sum(axis=0, dtype=np.int64)
-    bonus_hits = int(bonus_flags_array.sum())
-
-    return (
-        results,
-        bonus_hits,
-        agg_stats0,
-        agg_stats1,
-        agg_stats2,
-        yatzy_hits_array,
-        bonus_flags_array,
-        elapsed_ms,
-        total_threads,
     )
 
 
@@ -1045,8 +780,6 @@ class _SimulationAccumulator:
 
 def SimulateRounds(
     count,
-    processes=None,
-    backend="auto",
     chunk_size=None,
     store_results_threshold=1_000_000_000,
     output_dir="results",
@@ -1058,22 +791,8 @@ def SimulateRounds(
     if count <= 0:
         raise ValueError("count must be a positive integer")
 
-    backend_normalized = backend.lower()
-    if backend_normalized not in {"auto", "python", "numba", "cuda"}:
-        raise ValueError("backend must be one of 'auto', 'python', 'numba', or 'cuda'")
-
-    if backend_normalized == "auto":
-        if CUDA_AVAILABLE:
-            backend_normalized = "cuda"
-        elif NUMBA_AVAILABLE:
-            backend_normalized = "numba"
-        else:
-            backend_normalized = "python"
-
-    if backend_normalized == "cuda" and not CUDA_AVAILABLE:
-        raise RuntimeError("CUDA backend requested but CUDA is not available.")
-    if backend_normalized == "numba" and not NUMBA_AVAILABLE:
-        raise RuntimeError("Numba backend requested but numba is not available.")
+    if not NUMBA_AVAILABLE:
+        raise RuntimeError("Numba is required for simulation but is not available.")
 
     if chunk_size is None:
         chunk_size = min(count, 10_000_000)
@@ -1084,18 +803,10 @@ def SimulateRounds(
     store_results = count <= store_results_threshold
     accumulator = _SimulationAccumulator(store_results=store_results)
 
-    if backend_normalized == "cuda":
-        def backend_runner(batch_size):
-            return _simulate_cuda_backend(batch_size)
-        run_label_template = "CUDA threads={units}"
-    elif backend_normalized == "numba":
-        def backend_runner(batch_size):
-            return _simulate_numba_backend(batch_size)
-        run_label_template = "Numba parallel (threads={units})"
-    else:
-        def backend_runner(batch_size):
-            return _simulate_python_backend(batch_size, processes)
-        run_label_template = "{units} process(es)"
+    def backend_runner(batch_size):
+        return _simulate_numba_backend(batch_size)
+
+    run_label_template = "Numba parallel (threads={units})"
 
     start_time = time.time()
     run_start_unix = int(start_time)
@@ -1522,10 +1233,8 @@ def SimulateRounds(
         metadata = {
             "run": {
                 "count": int(count),
-                "backend_requested": backend,
-                "backend_used": backend_normalized,
                 "run_label": run_label,
-                "processes_requested": processes,
+                "numba_threads_used": int(units_value) if units_value is not None else None,
                 "chunk_size": chunk_size_info,
                 "store_results": bool(store_results),
                 "store_results_threshold": int(store_results_threshold),
@@ -1569,7 +1278,6 @@ def SimulateRounds(
                 "python_executable": sys.executable,
                 "cpu_count": os.cpu_count(),
                 "numba_available": NUMBA_AVAILABLE,
-                "cuda_available": CUDA_AVAILABLE,
             },
             "artifacts": {
                 "stats_csv": str(csv_path),
@@ -1618,18 +1326,6 @@ def _build_argument_parser():
         type=_parse_positive_int,
         default=1_000_000,
         help="Number of games to simulate (default: 1,000,000).",
-    )
-    parser.add_argument(
-        "--processes",
-        type=_parse_optional_positive_int,
-        default=16,
-        help="Worker processes for Python backend (default: 16). Use 'auto' to let the program decide.",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=["auto", "python", "numba", "cuda"],
-        default="auto",
-        help="Simulation backend to use (default: auto).",
     )
     parser.add_argument(
         "--chunk-size",
@@ -1715,8 +1411,6 @@ if __name__ == "__main__":
     try:
         SimulateRounds(
             count=cli_args.count,
-            processes=cli_args.processes,
-            backend=cli_args.backend,
             chunk_size=cli_args.chunk_size,
             store_results_threshold=cli_args.store_results_threshold,
             output_dir=cli_args.output_dir,
