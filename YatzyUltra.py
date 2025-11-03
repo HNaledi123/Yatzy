@@ -269,7 +269,7 @@ def _satisfied_categories(dice_array, counts, sorted_dice, dice_sum):
 
 
 def _build_roll_cache():
-    score_table = np.zeros((ROLL_STATE_COUNT, NUM_CATEGORIES), dtype=np.int16)
+    score_table = np.zeros((ROLL_STATE_COUNT, NUM_CATEGORIES), dtype=np.int8)
     sat_matrix = np.zeros((ROLL_STATE_COUNT, NUM_CATEGORIES), dtype=np.uint8)
     sat_lists = [()] * ROLL_STATE_COUNT
     keep_values = np.empty(ROLL_STATE_COUNT, dtype=np.int8)
@@ -321,16 +321,16 @@ def _evaluate_best_category_from_index(roll_index, allowed_mask):
 
 
 if NUMBA_AVAILABLE:
-    CATEGORY_PRIORITY_NUMBA = CATEGORY_PRIORITY.astype(np.int16)
+    CATEGORY_PRIORITY_NUMBA = CATEGORY_PRIORITY.astype(np.int8)
 
-    @njit(cache=True)
+    @njit(cache=True, nogil=True)
     def _encode_roll_numba(dice_array):
         key = 0
         for value in dice_array:
             key = key * 6 + (int(value) - 1)
         return key
 
-    @njit(cache=True)
+    @njit(cache=True, nogil=True)
     def _reroll_keep_most_common_array_numba(dice_array, roll_index, out):
         keep_count = int(ROLL_KEEP_COUNT[roll_index])
         if keep_count == 5:
@@ -344,7 +344,7 @@ if NUMBA_AVAILABLE:
         for i in range(keep_count, 5):
             out[i] = np.int8(np.random.randint(1, 7))
 
-    @njit(cache=True)
+    @njit(cache=True, nogil=True)
     def _evaluate_best_category_from_index_numba(roll_index, allowed_bits):
         scores = ROLL_SCORE_TABLE[roll_index]
         best_score = -1
@@ -359,7 +359,7 @@ if NUMBA_AVAILABLE:
                 best_idx = idx
         return best_score, best_idx
 
-    @njit(cache=True)
+    @njit(cache=True, nogil=True)
     def _play_yatzy_numba(dice0, dice1, dice2):
         allowed_bits = (1 << NUM_CATEGORIES) - 1
         total_points = 0
@@ -386,7 +386,7 @@ if NUMBA_AVAILABLE:
         total_points += bonus
         return total_points
 
-    @njit(parallel=True, cache=True)
+    @njit(parallel=True, cache=True, nogil=True)
     def _simulate_chunk_numba(count, seed):
         np.random.seed(seed)
         results = np.empty(count, dtype=np.uint16)
