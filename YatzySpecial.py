@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 from itertools import product
 from pathlib import Path
 import sys
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -87,6 +87,57 @@ CATEGORY_PRIORITY = np.array([
 
 HistogramBins = Union[int, str, None]
 NUMBA_RUN_LABEL_TEMPLATE = "Numba parallel (threads={units})"
+
+CATEGORY_DISPLAY_NAMES: Dict[str, str] = {
+    "Upper1": "Ettor",
+    "Upper2": "Tvåor",
+    "Upper3": "Treor",
+    "Upper4": "Fyror",
+    "Upper5": "Femmor",
+    "Upper6": "Sexor",
+    "OfAKind2": "Ett par",
+    "OfAKind3": "Tretal",
+    "OfAKind4": "Fyrtal",
+    "OfAKind5": "Yatzy",
+    "TwoPairs": "Två par",
+    "SmallStraight": "Liten stege",
+    "LargeStraight": "Stor stege",
+    "FullHouse": "Kåk",
+    "Chance": "Chans",
+}
+
+EXPECTED_INITIAL_ROLL_PROBABILITIES: Dict[str, float] = {
+    "Upper1": 4651 / 7776,
+    "Upper2": 4651 / 7776,
+    "Upper3": 4651 / 7776,
+    "Upper4": 4651 / 7776,
+    "Upper5": 4651 / 7776,
+    "Upper6": 4651 / 7776,
+    "OfAKind2": 7056 / 7776,
+    "TwoPairs": 2100 / 7776,
+    "OfAKind3": 1656 / 7776,
+    "OfAKind4": 156 / 7776,
+    "SmallStraight": 120 / 7776,
+    "LargeStraight": 120 / 7776,
+    "FullHouse": 300 / 7776,
+    "Chance": 1.0,
+    "OfAKind5": 6 / 7776,
+}
+
+DEFAULT_EXPECTED_MEAN_SCORE = 163.861
+
+DEFAULT_STUDY_COUNTS: List[int] = [
+    1,
+    10,
+    100,
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+]
 
 
 ## --- DATA MODELS ---
@@ -1375,6 +1426,234 @@ def _write_run_metadata(
     return _write_metadata_file(artifact_info["run_dir"], artifact_info["run_basename"], metadata)
 
 
+def _run_and_export_simulation(config: SimulationConfig):
+    summary: SimulationSummary
+    run_data = _run_simulation_loop(config)
+    summary = _summarize_run(config, run_data)
+    _print_run_summary(summary)
+
+    artifact_info = _export_run_artifacts(config, summary, run_data)
+
+    metadata_path = None
+    if config.save_run_metadata:
+        metadata_path = _write_run_metadata(config, summary, artifact_info)
+        print(f"Saved metadata to: {metadata_path}")
+
+    print(f"Artifacts saved under: {artifact_info['run_dir']}")
+    return summary, run_data, artifact_info, metadata_path
+
+
+def _parse_study_counts_argument(raw_value) -> List[int]:
+    if raw_value is None:
+        return DEFAULT_STUDY_COUNTS.copy()
+
+    if isinstance(raw_value, (list, tuple)):
+        counts: List[int] = []
+        for element in raw_value:
+            counts.extend(_parse_study_counts_argument(element))
+        return list(dict.fromkeys(counts))
+
+    text = str(raw_value).strip()
+    if not text:
+        return DEFAULT_STUDY_COUNTS.copy()
+
+    lowered = text.lower()
+    if lowered in {"auto", "default"}:
+        return DEFAULT_STUDY_COUNTS.copy()
+
+    counts: List[int] = []
+    for token in text.replace(";", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        normalized = token.replace("_", "")
+        try:
+            if normalized.lower().startswith("1e"):
+                value = int(float(normalized))
+            elif any(ch in normalized for ch in ".eE"):
+                value = int(float(normalized))
+            else:
+                value = int(normalized, 10)
+        except ValueError as exc:
+            raise ValueError(f"Invalid study count value: {token!r}") from exc
+        if value <= 0:
+            raise ValueError(f"Study counts must be positive integers (got {value}).")
+        counts.append(value)
+
+    if not counts:
+        raise ValueError("No study counts were provided.")
+
+    return list(dict.fromkeys(counts))
+
+
+def _initial_roll_deviation_records(
+    summary: SimulationSummary,
+    accumulator: "_SimulationAccumulator",
+    expected_probabilities: Dict[str, float],
+    study_run_index: int,
+    run_dir: Path,
+):
+    total_rolls = summary.count * NUM_ROUNDS
+    if total_rolls <= 0:
+        raise ValueError("Total number of simulated rolls must be positive.")
+
+    records = []
+    for idx, category in enumerate(CATEGORY_NAMES):
+        expected_prob = expected_probabilities.get(category)
+        if expected_prob is None:
+            raise KeyError(f"No expected initial-roll probability defined for category {category!r}.")
+
+        observed_count = int(accumulator.agg_stats0[idx])
+        observed_probability = observed_count / total_rolls
+        expected_count = expected_prob * total_rolls
+        deviation = observed_probability - expected_prob
+        abs_deviation = abs(deviation)
+
+        record = {
+            "StudyRunIndex": study_run_index,
+            "SimulationCount": int(summary.count),
+            "Category": category,
+            "CategoryDisplay": CATEGORY_DISPLAY_NAMES.get(category, category),
+            "TotalFirstRolls": int(total_rolls),
+            "ObservedCount": observed_count,
+            "ExpectedCount": expected_count,
+            "ObservedProbability": observed_probability,
+            "ExpectedProbability": expected_prob,
+            "Deviation": deviation,
+            "AbsDeviation": abs_deviation,
+            "ObservedPercentage": observed_probability * 100.0,
+            "ExpectedPercentage": expected_prob * 100.0,
+            "DeviationPercentage": deviation * 100.0,
+            "AbsDeviationPercentage": abs_deviation * 100.0,
+            "RelativeAbsError": abs_deviation / expected_prob if expected_prob > 0 else None,
+            "RunDirectory": str(run_dir),
+        }
+        records.append(record)
+    return records
+
+
+def _build_study_run_summary(
+    summary: SimulationSummary,
+    expected_mean_score: float,
+    run_records,
+    study_run_index: int,
+    run_dir: Path,
+):
+    mean_deviation = summary.mean - expected_mean_score
+    mean_deviation_percent = (mean_deviation / expected_mean_score * 100.0) if expected_mean_score else None
+    elapsed_seconds = summary.elapsed_seconds
+    games_per_second = summary.count / elapsed_seconds if elapsed_seconds > 0 else None
+
+    abs_deviations = [record["AbsDeviation"] for record in run_records]
+    rel_abs_errors = [record["RelativeAbsError"] for record in run_records if record["RelativeAbsError"] is not None]
+
+    summary_record = {
+        "StudyRunIndex": study_run_index,
+        "SimulationCount": int(summary.count),
+        "ObservedMeanScore": summary.mean,
+        "ExpectedMeanScore": expected_mean_score,
+        "MeanDeviation": mean_deviation,
+        "AbsMeanDeviation": abs(mean_deviation),
+        "MeanDeviationPercentage": mean_deviation_percent,
+        "AbsMeanDeviationPercentage": abs(mean_deviation_percent) if mean_deviation_percent is not None else None,
+        "Std": summary.std,
+        "ElapsedMs": summary.elapsed_ms,
+        "ElapsedSeconds": elapsed_seconds,
+        "GamesPerSecond": games_per_second if (games_per_second is not None and math.isfinite(games_per_second)) else None,
+        "InitialRollMeanAbsDeviation": float(np.mean(abs_deviations)) if abs_deviations else 0.0,
+        "InitialRollMaxAbsDeviation": float(np.max(abs_deviations)) if abs_deviations else 0.0,
+        "InitialRollMeanRelativeAbsError": float(np.mean(rel_abs_errors)) if rel_abs_errors else 0.0,
+        "InitialRollMaxRelativeAbsError": float(np.max(rel_abs_errors)) if rel_abs_errors else 0.0,
+        "RunDirectory": str(run_dir),
+    }
+    return summary_record
+
+
+def RunProbabilityDeviationStudy(
+    counts: List[int],
+    chunk_size=None,
+    store_results_threshold=10_000_000,
+    output_dir="results",
+    histogram_bins=20,
+    save_plots=True,
+    show_plots=False,
+    save_run_metadata=True,
+    expected_mean_score: float = DEFAULT_EXPECTED_MEAN_SCORE,
+    expected_probabilities: Dict[str, float] = EXPECTED_INITIAL_ROLL_PROBABILITIES,
+):
+    if not counts:
+        raise ValueError("At least one simulation count is required for the probability deviation study.")
+    if not NUMBA_AVAILABLE:
+        raise RuntimeError("Numba is required for the simulation study but is not available.")
+
+    counts = list(dict.fromkeys(counts))
+    base_output_dir = Path(output_dir) if output_dir else Path.cwd()
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    study_root = base_output_dir / f"probability_study_{timestamp}"
+    study_root.mkdir(parents=True, exist_ok=True)
+
+    counts_label = ", ".join(f"{value:,}" for value in counts)
+    print(f"Running probability deviation study for simulation counts: {counts_label}")
+    print(f"Probability study artifacts will be written under: {study_root}")
+
+    category_records = []
+    summary_records = []
+
+    for index, count in enumerate(counts, start=1):
+        print(f"\n=== Study run {index}/{len(counts)} | {count:,} games ===")
+        config = SimulationConfig.from_inputs(
+            count=count,
+            chunk_size=chunk_size,
+            store_results_threshold=store_results_threshold,
+            output_dir=study_root,
+            histogram_bins=histogram_bins,
+            save_plots=save_plots,
+            show_plots=show_plots,
+            save_run_metadata=save_run_metadata,
+        )
+
+        summary, run_data, artifact_info, _ = _run_and_export_simulation(config)
+
+        run_records = _initial_roll_deviation_records(
+            summary=summary,
+            accumulator=run_data.accumulator,
+            expected_probabilities=expected_probabilities,
+            study_run_index=index,
+            run_dir=artifact_info["run_dir"],
+        )
+        category_records.extend(run_records)
+
+        summary_records.append(
+            _build_study_run_summary(
+                summary=summary,
+                expected_mean_score=expected_mean_score,
+                run_records=run_records,
+                study_run_index=index,
+                run_dir=artifact_info["run_dir"],
+            )
+        )
+
+        # Release memory for large result arrays early.
+        del run_data
+
+    category_df = pd.DataFrame(category_records)
+    summary_df = pd.DataFrame(summary_records)
+
+    category_csv = study_root / "probability_study_initial_roll_deviation.csv"
+    summary_csv = study_root / "probability_study_summary.csv"
+    category_df.to_csv(category_csv, index=False)
+    summary_df.to_csv(summary_csv, index=False)
+
+    print(f"\nSaved initial-roll deviation details to: {category_csv}")
+    print(f"Saved study summary to: {summary_csv}")
+
+    return {
+        "study_dir": study_root,
+        "category_csv": category_csv,
+        "summary_csv": summary_csv,
+    }
+
+
 def SimulateRounds(
     count,
     chunk_size=None,
@@ -1396,17 +1675,7 @@ def SimulateRounds(
         save_run_metadata=save_run_metadata,
     )
 
-    run_data = _run_simulation_loop(config)
-    summary = _summarize_run(config, run_data)
-    _print_run_summary(summary)
-
-    artifact_info = _export_run_artifacts(config, summary, run_data)
-
-    if config.save_run_metadata:
-        metadata_path = _write_run_metadata(config, summary, artifact_info)
-        print(f"Saved metadata to: {metadata_path}")
-
-    print(f"Artifacts saved under: {artifact_info['run_dir']}")
+    _run_and_export_simulation(config)
 
 
 def _parse_positive_int(value):
@@ -1507,6 +1776,25 @@ def _build_argument_parser():
         help="Skip writing metadata JSON.",
     )
     parser.add_argument(
+        "--probability-study",
+        dest="probability_study",
+        action="store_true",
+        help="Run a deviation study across multiple simulation counts instead of a single run.",
+    )
+    parser.add_argument(
+        "--study-counts",
+        dest="study_counts",
+        default=None,
+        help="Comma-separated simulation counts or 'auto' for the default progression (1, 10, ..., 1e9).",
+    )
+    parser.add_argument(
+        "--expected-mean-score",
+        dest="expected_mean_score",
+        type=float,
+        default=DEFAULT_EXPECTED_MEAN_SCORE,
+        help=f"Expected mean total score used for deviation comparisons (default: {DEFAULT_EXPECTED_MEAN_SCORE}).",
+    )
+    parser.add_argument(
         "--cleanup",
         dest="cleanup",
         action="store_true",
@@ -1526,16 +1814,34 @@ if __name__ == "__main__":
     cli_parser = _build_argument_parser()
     cli_args = cli_parser.parse_args()
     try:
-        SimulateRounds(
-            count=cli_args.count,
-            chunk_size=cli_args.chunk_size,
-            store_results_threshold=cli_args.store_results_threshold,
-            output_dir=cli_args.output_dir,
-            histogram_bins=cli_args.histogram_bins,
-            save_plots=cli_args.save_plots,
-            show_plots=cli_args.show_plots,
-            save_run_metadata=cli_args.save_run_metadata,
-        )
+        if cli_args.probability_study:
+            try:
+                study_counts = _parse_study_counts_argument(cli_args.study_counts)
+            except ValueError as exc:
+                cli_parser.error(str(exc))
+
+            RunProbabilityDeviationStudy(
+                counts=study_counts,
+                chunk_size=cli_args.chunk_size,
+                store_results_threshold=cli_args.store_results_threshold,
+                output_dir=cli_args.output_dir,
+                histogram_bins=cli_args.histogram_bins,
+                save_plots=cli_args.save_plots,
+                show_plots=cli_args.show_plots,
+                save_run_metadata=cli_args.save_run_metadata,
+                expected_mean_score=cli_args.expected_mean_score,
+            )
+        else:
+            SimulateRounds(
+                count=cli_args.count,
+                chunk_size=cli_args.chunk_size,
+                store_results_threshold=cli_args.store_results_threshold,
+                output_dir=cli_args.output_dir,
+                histogram_bins=cli_args.histogram_bins,
+                save_plots=cli_args.save_plots,
+                show_plots=cli_args.show_plots,
+                save_run_metadata=cli_args.save_run_metadata,
+            )
     finally:
         if cli_args.cleanup:
             script_directory = os.path.dirname(os.path.abspath(__file__))
