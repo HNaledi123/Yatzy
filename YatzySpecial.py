@@ -135,8 +135,6 @@ DEFAULT_STUDY_COUNTS: List[int] = [
     100_000,
     1_000_000,
     10_000_000,
-    100_000_000,
-    1_000_000_000,
 ]
 
 
@@ -1492,25 +1490,75 @@ def _initial_roll_deviation_records(
     expected_probabilities: Dict[str, float],
     study_run_index: int,
     run_dir: Path,
+    count_index: int,
+    counts_total: int,
+    repeat_index: int,
+    total_repeats: int,
 ):
     total_rolls = summary.count * NUM_ROUNDS
     if total_rolls <= 0:
         raise ValueError("Total number of simulated rolls must be positive.")
 
+    expected_probs = np.array(
+        [expected_probabilities.get(category, np.nan) for category in CATEGORY_NAMES],
+        dtype=np.float64,
+    )
+    if np.any(np.isnan(expected_probs)):
+        missing = [CATEGORY_NAMES[i] for i, value in enumerate(expected_probs) if np.isnan(value)]
+        raise KeyError(f"No expected initial-roll probability defined for categories: {', '.join(missing)}")
+
+    observed_counts_int = accumulator.agg_stats0.astype(np.int64, copy=False)
+    observed_probabilities = observed_counts_int.astype(np.float64) / float(total_rolls)
+    deviations = observed_probabilities - expected_probs
+    abs_deviations = np.abs(deviations)
+    deviations_percentage = deviations * 100.0
+    abs_deviations_percentage = abs_deviations * 100.0
+
+    run_mean_abs_deviation = float(abs_deviations.mean())
+    run_mean_abs_deviation_percentage = float(run_mean_abs_deviation * 100.0)
+    run_max_abs_deviation = float(abs_deviations.max())
+    run_max_abs_deviation_percentage = float(run_max_abs_deviation * 100.0)
+    run_mean_deviation = float(deviations.mean())
+    run_mean_deviation_percentage = float(run_mean_deviation * 100.0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        relative_abs_errors = np.where(expected_probs > 0, abs_deviations / expected_probs, np.nan)
+    valid_relative_abs_errors = relative_abs_errors[np.isfinite(relative_abs_errors)]
+    run_mean_relative_abs_error = (
+        float(valid_relative_abs_errors.mean()) if valid_relative_abs_errors.size else None
+    )
+    run_max_relative_abs_error = (
+        float(valid_relative_abs_errors.max()) if valid_relative_abs_errors.size else None
+    )
+
+    run_metrics = {
+        "mean_deviation": run_mean_deviation,
+        "mean_deviation_percentage": run_mean_deviation_percentage,
+        "mean_abs_deviation": run_mean_abs_deviation,
+        "mean_abs_deviation_percentage": run_mean_abs_deviation_percentage,
+        "max_abs_deviation": run_max_abs_deviation,
+        "max_abs_deviation_percentage": run_max_abs_deviation_percentage,
+        "mean_relative_abs_error": run_mean_relative_abs_error,
+        "max_relative_abs_error": run_max_relative_abs_error,
+    }
+
     records = []
     for idx, category in enumerate(CATEGORY_NAMES):
-        expected_prob = expected_probabilities.get(category)
-        if expected_prob is None:
-            raise KeyError(f"No expected initial-roll probability defined for category {category!r}.")
-
-        observed_count = int(accumulator.agg_stats0[idx])
-        observed_probability = observed_count / total_rolls
-        expected_count = expected_prob * total_rolls
-        deviation = observed_probability - expected_prob
-        abs_deviation = abs(deviation)
+        expected_prob = float(expected_probs[idx])
+        observed_count = int(observed_counts_int[idx])
+        observed_probability = float(observed_probabilities[idx])
+        expected_count = float(expected_prob * total_rolls)
+        deviation = float(deviations[idx])
+        abs_deviation = float(abs_deviations[idx])
+        relative_error_value = relative_abs_errors[idx]
+        relative_abs_error = float(relative_error_value) if np.isfinite(relative_error_value) else None
 
         record = {
             "StudyRunIndex": study_run_index,
+            "CountIndex": count_index,
+            "CountsTotal": counts_total,
+            "RepeatIndex": repeat_index,
+            "TotalRepeats": total_repeats,
             "SimulationCount": int(summary.count),
             "Category": category,
             "CategoryDisplay": CATEGORY_DISPLAY_NAMES.get(category, category),
@@ -1521,34 +1569,47 @@ def _initial_roll_deviation_records(
             "ExpectedProbability": expected_prob,
             "Deviation": deviation,
             "AbsDeviation": abs_deviation,
-            "ObservedPercentage": observed_probability * 100.0,
-            "ExpectedPercentage": expected_prob * 100.0,
-            "DeviationPercentage": deviation * 100.0,
-            "AbsDeviationPercentage": abs_deviation * 100.0,
-            "RelativeAbsError": abs_deviation / expected_prob if expected_prob > 0 else None,
+            "ObservedPercentage": float(observed_probability * 100.0),
+            "ExpectedPercentage": float(expected_prob * 100.0),
+            "DeviationPercentage": float(deviations_percentage[idx]),
+            "AbsDeviationPercentage": float(abs_deviations_percentage[idx]),
+            "RelativeAbsError": relative_abs_error,
+            "RunMeanDeviation": run_mean_deviation,
+            "RunMeanDeviationPercentage": run_mean_deviation_percentage,
+            "RunMeanAbsDeviation": run_mean_abs_deviation,
+            "RunMeanAbsDeviationPercentage": run_mean_abs_deviation_percentage,
+            "RunMaxAbsDeviation": run_max_abs_deviation,
+            "RunMaxAbsDeviationPercentage": run_max_abs_deviation_percentage,
+            "RunMeanRelativeAbsError": run_mean_relative_abs_error,
+            "RunMaxRelativeAbsError": run_max_relative_abs_error,
             "RunDirectory": str(run_dir),
         }
         records.append(record)
-    return records
+    return records, run_metrics
 
 
 def _build_study_run_summary(
     summary: SimulationSummary,
     expected_mean_score: float,
-    run_records,
     study_run_index: int,
     run_dir: Path,
+    run_metrics,
+    count_index: int,
+    counts_total: int,
+    repeat_index: int,
+    total_repeats: int,
 ):
     mean_deviation = summary.mean - expected_mean_score
     mean_deviation_percent = (mean_deviation / expected_mean_score * 100.0) if expected_mean_score else None
     elapsed_seconds = summary.elapsed_seconds
     games_per_second = summary.count / elapsed_seconds if elapsed_seconds > 0 else None
 
-    abs_deviations = [record["AbsDeviation"] for record in run_records]
-    rel_abs_errors = [record["RelativeAbsError"] for record in run_records if record["RelativeAbsError"] is not None]
-
     summary_record = {
         "StudyRunIndex": study_run_index,
+        "CountIndex": count_index,
+        "CountsTotal": counts_total,
+        "RepeatIndex": repeat_index,
+        "TotalRepeats": total_repeats,
         "SimulationCount": int(summary.count),
         "ObservedMeanScore": summary.mean,
         "ExpectedMeanScore": expected_mean_score,
@@ -1560,10 +1621,14 @@ def _build_study_run_summary(
         "ElapsedMs": summary.elapsed_ms,
         "ElapsedSeconds": elapsed_seconds,
         "GamesPerSecond": games_per_second if (games_per_second is not None and math.isfinite(games_per_second)) else None,
-        "InitialRollMeanAbsDeviation": float(np.mean(abs_deviations)) if abs_deviations else 0.0,
-        "InitialRollMaxAbsDeviation": float(np.max(abs_deviations)) if abs_deviations else 0.0,
-        "InitialRollMeanRelativeAbsError": float(np.mean(rel_abs_errors)) if rel_abs_errors else 0.0,
-        "InitialRollMaxRelativeAbsError": float(np.max(rel_abs_errors)) if rel_abs_errors else 0.0,
+        "InitialRollMeanDeviation": run_metrics["mean_deviation"],
+        "InitialRollMeanDeviationPercentage": run_metrics["mean_deviation_percentage"],
+        "InitialRollMeanAbsDeviation": run_metrics["mean_abs_deviation"],
+        "InitialRollMeanAbsDeviationPercentage": run_metrics["mean_abs_deviation_percentage"],
+        "InitialRollMaxAbsDeviation": run_metrics["max_abs_deviation"],
+        "InitialRollMaxAbsDeviationPercentage": run_metrics["max_abs_deviation_percentage"],
+        "InitialRollMeanRelativeAbsError": run_metrics["mean_relative_abs_error"],
+        "InitialRollMaxRelativeAbsError": run_metrics["max_relative_abs_error"],
         "RunDirectory": str(run_dir),
     }
     return summary_record
@@ -1580,11 +1645,14 @@ def RunProbabilityDeviationStudy(
     save_run_metadata=True,
     expected_mean_score: float = DEFAULT_EXPECTED_MEAN_SCORE,
     expected_probabilities: Dict[str, float] = EXPECTED_INITIAL_ROLL_PROBABILITIES,
+    study_repeats: int = 1,
 ):
     if not counts:
         raise ValueError("At least one simulation count is required for the probability deviation study.")
     if not NUMBA_AVAILABLE:
         raise RuntimeError("Numba is required for the simulation study but is not available.")
+    if study_repeats <= 0:
+        raise ValueError("study_repeats must be a positive integer.")
 
     counts = list(dict.fromkeys(counts))
     base_output_dir = Path(output_dir) if output_dir else Path.cwd()
@@ -1594,47 +1662,66 @@ def RunProbabilityDeviationStudy(
 
     counts_label = ", ".join(f"{value:,}" for value in counts)
     print(f"Running probability deviation study for simulation counts: {counts_label}")
+    if study_repeats > 1:
+        print(f"Each simulation count will be repeated {study_repeats} times.")
     print(f"Probability study artifacts will be written under: {study_root}")
 
     category_records = []
     summary_records = []
 
-    for index, count in enumerate(counts, start=1):
-        print(f"\n=== Study run {index}/{len(counts)} | {count:,} games ===")
-        config = SimulationConfig.from_inputs(
-            count=count,
-            chunk_size=chunk_size,
-            store_results_threshold=store_results_threshold,
-            output_dir=study_root,
-            histogram_bins=histogram_bins,
-            save_plots=save_plots,
-            show_plots=show_plots,
-            save_run_metadata=save_run_metadata,
-        )
+    counts_total = len(counts)
+    total_runs = counts_total * study_repeats
+    run_counter = 0
 
-        summary, run_data, artifact_info, _ = _run_and_export_simulation(config)
-
-        run_records = _initial_roll_deviation_records(
-            summary=summary,
-            accumulator=run_data.accumulator,
-            expected_probabilities=expected_probabilities,
-            study_run_index=index,
-            run_dir=artifact_info["run_dir"],
-        )
-        category_records.extend(run_records)
-
-        summary_records.append(
-            _build_study_run_summary(
-                summary=summary,
-                expected_mean_score=expected_mean_score,
-                run_records=run_records,
-                study_run_index=index,
-                run_dir=artifact_info["run_dir"],
+    for count_index, count in enumerate(counts, start=1):
+        for repeat_index in range(1, study_repeats + 1):
+            run_counter += 1
+            print(
+                f"\n=== Study run {run_counter}/{total_runs} | count idx {count_index}/{counts_total} | "
+                f"{count:,} games | set {repeat_index}/{study_repeats} ==="
             )
-        )
+            config = SimulationConfig.from_inputs(
+                count=count,
+                chunk_size=chunk_size,
+                store_results_threshold=store_results_threshold,
+                output_dir=study_root,
+                histogram_bins=histogram_bins,
+                save_plots=save_plots,
+                show_plots=show_plots,
+                save_run_metadata=save_run_metadata,
+            )
 
-        # Release memory for large result arrays early.
-        del run_data
+            summary, run_data, artifact_info, _ = _run_and_export_simulation(config)
+
+            run_records, run_metrics = _initial_roll_deviation_records(
+                summary=summary,
+                accumulator=run_data.accumulator,
+                expected_probabilities=expected_probabilities,
+                study_run_index=run_counter,
+                run_dir=artifact_info["run_dir"],
+                count_index=count_index,
+                counts_total=counts_total,
+                repeat_index=repeat_index,
+                total_repeats=study_repeats,
+            )
+            category_records.extend(run_records)
+
+            summary_records.append(
+                _build_study_run_summary(
+                    summary=summary,
+                    expected_mean_score=expected_mean_score,
+                    study_run_index=run_counter,
+                    run_dir=artifact_info["run_dir"],
+                    run_metrics=run_metrics,
+                    count_index=count_index,
+                    counts_total=counts_total,
+                    repeat_index=repeat_index,
+                    total_repeats=study_repeats,
+                )
+            )
+
+            # Release memory for large result arrays early.
+            del run_data
 
     category_df = pd.DataFrame(category_records)
     summary_df = pd.DataFrame(summary_records)
@@ -1651,6 +1738,7 @@ def RunProbabilityDeviationStudy(
         "study_dir": study_root,
         "category_csv": category_csv,
         "summary_csv": summary_csv,
+        "study_repeats": study_repeats,
     }
 
 
@@ -1795,6 +1883,13 @@ def _build_argument_parser():
         help=f"Expected mean total score used for deviation comparisons (default: {DEFAULT_EXPECTED_MEAN_SCORE}).",
     )
     parser.add_argument(
+        "--study-repeats",
+        dest="study_repeats",
+        type=_parse_positive_int,
+        default=1,
+        help="Repeat each simulation count this many times when running a probability study (default: 1).",
+    )
+    parser.add_argument(
         "--cleanup",
         dest="cleanup",
         action="store_true",
@@ -1830,6 +1925,7 @@ if __name__ == "__main__":
                 show_plots=cli_args.show_plots,
                 save_run_metadata=cli_args.save_run_metadata,
                 expected_mean_score=cli_args.expected_mean_score,
+                study_repeats=cli_args.study_repeats,
             )
         else:
             SimulateRounds(
