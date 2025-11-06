@@ -1424,20 +1424,22 @@ def _write_run_metadata(
     return _write_metadata_file(artifact_info["run_dir"], artifact_info["run_basename"], metadata)
 
 
-def _run_and_export_simulation(config: SimulationConfig):
+def _run_and_export_simulation(config: SimulationConfig, export_artifacts: bool = True):
     summary: SimulationSummary
     run_data = _run_simulation_loop(config)
     summary = _summarize_run(config, run_data)
     _print_run_summary(summary)
 
-    artifact_info = _export_run_artifacts(config, summary, run_data)
-
+    artifact_info = None
     metadata_path = None
-    if config.save_run_metadata:
-        metadata_path = _write_run_metadata(config, summary, artifact_info)
-        print(f"Saved metadata to: {metadata_path}")
+    if export_artifacts:
+        artifact_info = _export_run_artifacts(config, summary, run_data)
 
-    print(f"Artifacts saved under: {artifact_info['run_dir']}")
+        if config.save_run_metadata:
+            metadata_path = _write_run_metadata(config, summary, artifact_info)
+            print(f"Saved metadata to: {metadata_path}")
+
+        print(f"Artifacts saved under: {artifact_info['run_dir']}")
     return summary, run_data, artifact_info, metadata_path
 
 
@@ -1489,7 +1491,7 @@ def _initial_roll_deviation_records(
     accumulator: "_SimulationAccumulator",
     expected_probabilities: Dict[str, float],
     study_run_index: int,
-    run_dir: Path,
+    run_dir: Optional[Path],
     count_index: int,
     counts_total: int,
     repeat_index: int,
@@ -1582,7 +1584,7 @@ def _initial_roll_deviation_records(
             "RunMaxAbsDeviationPercentage": run_max_abs_deviation_percentage,
             "RunMeanRelativeAbsError": run_mean_relative_abs_error,
             "RunMaxRelativeAbsError": run_max_relative_abs_error,
-            "RunDirectory": str(run_dir),
+            "RunDirectory": str(run_dir) if run_dir is not None else None,
         }
         records.append(record)
     return records, run_metrics
@@ -1592,7 +1594,7 @@ def _build_study_run_summary(
     summary: SimulationSummary,
     expected_mean_score: float,
     study_run_index: int,
-    run_dir: Path,
+    run_dir: Optional[Path],
     run_metrics,
     count_index: int,
     counts_total: int,
@@ -1629,7 +1631,7 @@ def _build_study_run_summary(
         "InitialRollMaxAbsDeviationPercentage": run_metrics["max_abs_deviation_percentage"],
         "InitialRollMeanRelativeAbsError": run_metrics["mean_relative_abs_error"],
         "InitialRollMaxRelativeAbsError": run_metrics["max_relative_abs_error"],
-        "RunDirectory": str(run_dir),
+        "RunDirectory": str(run_dir) if run_dir is not None else None,
     }
     return summary_record
 
@@ -1646,6 +1648,7 @@ def RunProbabilityDeviationStudy(
     expected_mean_score: float = DEFAULT_EXPECTED_MEAN_SCORE,
     expected_probabilities: Dict[str, float] = EXPECTED_INITIAL_ROLL_PROBABILITIES,
     study_repeats: int = 1,
+    study_export_artifacts: bool = False,
 ):
     if not counts:
         raise ValueError("At least one simulation count is required for the probability deviation study.")
@@ -1691,14 +1694,18 @@ def RunProbabilityDeviationStudy(
                 save_run_metadata=save_run_metadata,
             )
 
-            summary, run_data, artifact_info, _ = _run_and_export_simulation(config)
+            summary, run_data, artifact_info, _ = _run_and_export_simulation(
+                config,
+                export_artifacts=study_export_artifacts,
+            )
+            run_dir = artifact_info["run_dir"] if artifact_info is not None else None
 
             run_records, run_metrics = _initial_roll_deviation_records(
                 summary=summary,
                 accumulator=run_data.accumulator,
                 expected_probabilities=expected_probabilities,
                 study_run_index=run_counter,
-                run_dir=artifact_info["run_dir"],
+                run_dir=run_dir,
                 count_index=count_index,
                 counts_total=counts_total,
                 repeat_index=repeat_index,
@@ -1708,15 +1715,15 @@ def RunProbabilityDeviationStudy(
 
             summary_records.append(
                 _build_study_run_summary(
-                    summary=summary,
-                    expected_mean_score=expected_mean_score,
-                    study_run_index=run_counter,
-                    run_dir=artifact_info["run_dir"],
-                    run_metrics=run_metrics,
-                    count_index=count_index,
-                    counts_total=counts_total,
-                    repeat_index=repeat_index,
-                    total_repeats=study_repeats,
+                summary=summary,
+                expected_mean_score=expected_mean_score,
+                study_run_index=run_counter,
+                run_dir=run_dir,
+                run_metrics=run_metrics,
+                count_index=count_index,
+                counts_total=counts_total,
+                repeat_index=repeat_index,
+                total_repeats=study_repeats,
                 )
             )
 
@@ -1731,14 +1738,44 @@ def RunProbabilityDeviationStudy(
     category_df.to_csv(category_csv, index=False)
     summary_df.to_csv(summary_csv, index=False)
 
+    deviation_matrix = (
+        category_df.groupby(["CategoryDisplay", "SimulationCount"])["AbsDeviationPercentage"]
+        .mean()
+        .unstack("SimulationCount")
+    )
+    if deviation_matrix.empty:
+        deviation_matrix = pd.DataFrame()
+    else:
+        deviation_matrix = deviation_matrix.reindex(sorted(deviation_matrix.columns), axis=1)
+        overall_abs = (
+            category_df.groupby("SimulationCount")["AbsDeviationPercentage"]
+            .mean()
+            .reindex(deviation_matrix.columns)
+        )
+        deviation_matrix.index = [f"{name}_percent" for name in deviation_matrix.index]
+        deviation_matrix.loc["OverallAverageAbsDeviation_percent"] = overall_abs
+
+        summary_grouped = summary_df.groupby("SimulationCount")
+        mean_score_abs_deviation = (
+            summary_grouped["AbsMeanDeviation"]
+            .mean()
+            .reindex(deviation_matrix.columns)
+        )
+        deviation_matrix.loc["MeanScoreAbsDeviation_points"] = mean_score_abs_deviation
+
+    deviation_matrix_csv = study_root / "probability_study_deviation_matrix.csv"
+    deviation_matrix.to_csv(deviation_matrix_csv, float_format="%.6f")
+
     print(f"\nSaved initial-roll deviation details to: {category_csv}")
     print(f"Saved study summary to: {summary_csv}")
+    print(f"Saved deviation matrix to: {deviation_matrix_csv}")
 
     return {
         "study_dir": study_root,
         "category_csv": category_csv,
         "summary_csv": summary_csv,
         "study_repeats": study_repeats,
+        "deviation_matrix_csv": deviation_matrix_csv,
     }
 
 
@@ -1890,6 +1927,12 @@ def _build_argument_parser():
         help="Repeat each simulation count this many times when running a probability study (default: 1).",
     )
     parser.add_argument(
+        "--study-export-artifacts",
+        dest="study_export_artifacts",
+        action="store_true",
+        help="Keep per-run artifacts (CSV, plots, metadata) during probability studies; default skips them for speed.",
+    )
+    parser.add_argument(
         "--cleanup",
         dest="cleanup",
         action="store_true",
@@ -1926,6 +1969,7 @@ if __name__ == "__main__":
                 save_run_metadata=cli_args.save_run_metadata,
                 expected_mean_score=cli_args.expected_mean_score,
                 study_repeats=cli_args.study_repeats,
+                study_export_artifacts=cli_args.study_export_artifacts,
             )
         else:
             SimulateRounds(
