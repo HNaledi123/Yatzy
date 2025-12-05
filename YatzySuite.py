@@ -31,7 +31,7 @@ CATEGORY_TRANSLATION = {
     "FullHouse": "Full House", "Chance": "Chance"
 }
 
-NUM_CATEGORIES = len(CATEGORY_NAMES)
+NUM_CATEGORIES = 15
 # Mapping strict logic indices
 OF_A_KIND_TO_IDX = {2: 6, 3: 7, 4: 8, 5: 9}
 YATZY_IDX = 9
