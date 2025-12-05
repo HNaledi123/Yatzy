@@ -5,21 +5,18 @@ import math
 import os
 import time
 import sys
+import shutil
 import concurrent.futures
 from pathlib import Path
 import numpy as np
 
 # --- CONFIGURATION & CONSTANTS ---
 
-# Försök ladda Numba för prestanda
+# Strictly require Numba
 try:
     from numba import njit
-    # Vi behöver inte prange här eftersom vi använder ThreadPoolExecutor för att hantera trådar
-    # på en högre nivå för att hantera statistisk aggregering säkrare.
-    NUMBA_AVAILABLE = True
 except ImportError:
-    print("Varning: Numba saknas. Simuleringen kommer gå mycket långsamt.")
-    sys.exit(1)
+    sys.exit("Error: Numba is strictly required for this program. Please install it using 'pip install numba'.")
 
 CATEGORY_NAMES = [
     "Upper1", "Upper2", "Upper3", "Upper4", "Upper5", "Upper6",
@@ -49,7 +46,7 @@ EXPECTED_PROBS = np.array([
 
 ROLL_STATE_COUNT = 6 ** 5
 
-# --- LOOKUP TABLE GENERATION (Preserved for Exact Behavior) ---
+# --- LOOKUP TABLE GENERATION ---
 
 def _build_lookup_tables():
     from itertools import product
@@ -131,39 +128,29 @@ def _encode(dice):
 def _ai_reroll(dice, roll_idx, out):
     cnt = TBL_KEEP_CNT[roll_idx]
     if cnt == 5:
-        # Kopiera över direkt om vi behåller allt
         for i in range(5):
             out[i] = dice[i]
         return
         
     val = TBL_KEEP_VAL[roll_idx]
-    # Sätt de tärningar vi sparar
     for i in range(cnt): 
         out[i] = val
-    # Slå om resten
     for i in range(cnt, 5): 
         out[i] = np.random.randint(1, 7)
 
 @njit(cache=True, nogil=True)
 def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
-    """
-    Kör ett enda spel.
-    Tar in pre-allokerade arrayer (d0, d1, d2) för att undvika minnesallokering i loopen.
-    """
     allowed = 0x7FFF 
     total = 0
     upper = 0
     got_yatzy = False
     
-    # Loop unrolling optimization implicit via logic, but keep structure for stats
     for _ in range(NUM_CATEGORIES): 
         # Roll 1
         for i in range(5): 
             d0[i] = np.random.randint(1, 7)
         idx0 = _encode(d0)
         
-        # Ackumulera statistik för Roll 1
-        # (Direkt indexering i global array är snabbt i L1 cache eftersom tabellen är liten)
         row0 = TBL_SAT[idx0]
         for c in range(NUM_CATEGORIES): 
             stats0[c] += row0[c]
@@ -182,15 +169,12 @@ def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
         for c in range(NUM_CATEGORIES): 
             stats2[c] += row2[c]
         
-        # Välj kategori
         best_sc = -1
         best_id = -1
         scores = TBL_SCORES[idx2]
         
-        # Priority loop (kort, 15 varv)
         for i in range(NUM_CATEGORIES):
             cat = TBL_PRIO[i]
-            # Bitwise check om kategorin är ledig
             if (allowed >> cat) & 1:
                 s = scores[cat]
                 if s > best_sc:
@@ -203,7 +187,6 @@ def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
         if best_id == YATZY_IDX and best_sc > 0: 
             got_yatzy = True
         
-        # Markera kategori som tagen
         allowed &= ~(1 << best_id)
         
     bonus = 50 if upper >= 63 else 0
@@ -211,32 +194,21 @@ def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
 
 @njit(cache=True, nogil=True)
 def _worker_sim_batch(count, seed):
-    """
-    Arbetarfunktion som kör en batch av spel.
-    Körs med nogil=True vilket tillåter multitrådning från Python.
-    """
     np.random.seed(seed)
-    
-    # Utdata-arrayer
     scores_out = np.empty(count, dtype=np.int16)
     flags_out = np.empty(count, dtype=np.int8)
     
-    # Lokala statistik-ackumulatorer för denna tråd
     l_s0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     l_s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     l_s2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     
-    # Pre-allokera tärningsbuffertar för att undvika malloc i loopen
     d0 = np.empty(5, dtype=np.int8)
     d1 = np.empty(5, dtype=np.int8)
     d2 = np.empty(5, dtype=np.int8)
     
     for i in range(count):
         sc, bon, ytz = _play_game_optimized(l_s0, l_s1, l_s2, d0, d1, d2)
-        
         scores_out[i] = sc
-        
-        # Flagga: Bit 0 = Bonus, Bit 1 = Yatzy
         f = 0
         if bon: f |= 1
         if ytz: f |= 2
@@ -244,23 +216,15 @@ def _worker_sim_batch(count, seed):
         
     return scores_out, flags_out, l_s0, l_s1, l_s2
 
-# --- DRIVER LOGIC (MULTI-THREADED) ---
+# --- DRIVER LOGIC ---
 
 def run_simulation_parallel(total_count, batch_size=None):
-    """
-    Kör simuleringen parallellt över alla tillgängliga CPU-kärnor.
-    """
     if batch_size is None:
-        # Auto-tune: Försök dela upp i lagom stora bitar för att hålla alla kärnor upptagna
-        # men inte så små att overhead blir stor.
         cpu_count = os.cpu_count() or 4
-        # Dela upp totalen på ca 4 * cpu_count chunks för bra balans
         target_chunks = cpu_count * 4
         batch_size = max(1000, total_count // target_chunks)
-        # Cap batch size för att inte blockera progress bar för länge
         batch_size = min(batch_size, 100_000)
 
-    # Globala ackumulatorer
     agg_s0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     agg_s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     agg_s2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
@@ -270,48 +234,50 @@ def run_simulation_parallel(total_count, batch_size=None):
     
     futures = []
     processed = 0
-    
     start_time = time.time()
     
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        # Skapa jobb
         remaining = total_count
         while remaining > 0:
             count = min(batch_size, remaining)
-            # Generera seed i Python (main thread) för att garantera unikhet
             seed = np.random.randint(0, 2**30)
             futures.append(executor.submit(_worker_sim_batch, count, seed))
             remaining -= count
             
-        # Hämta resultat
         completed = 0
         for f in concurrent.futures.as_completed(futures):
             res_scores, res_flags, r_s0, r_s1, r_s2 = f.result()
             
-            # Aggregera statistik
             agg_s0 += r_s0
             agg_s1 += r_s1
             agg_s2 += r_s2
             
-            # Spara rådata (kan optimeras med pre-allokering om minne är trångt, men list extend är snabbt nog här)
             all_scores.append(res_scores)
             all_flags.append(res_flags)
             
             completed += len(res_scores)
             
-            # Progress bar
             elapsed = time.time() - start_time
             rate = completed / elapsed if elapsed > 0 else 0
             eta = (total_count - completed) / rate if rate > 0 else 0
             print(f"\rSimulerar: {completed/total_count*100:.1f}% | {rate:,.0f} spel/s | ETA: {eta:.0f}s", end="")
             
-    print() # Newline after progress
-    
-    # Slå ihop arrayer
+    print()
     final_scores = np.concatenate(all_scores)
     final_flags = np.concatenate(all_flags)
     
     return final_scores, final_flags, agg_s0, agg_s1, agg_s2
+
+def _cleanup_pycache(root_directory):
+    """Tar bort __pycache__ mappar rekursivt."""
+    found = False
+    for dirpath, dirnames, _ in os.walk(root_directory):
+        if "__pycache__" in dirnames:
+            pycache_path = os.path.join(dirpath, "__pycache__")
+            shutil.rmtree(pycache_path, ignore_errors=True)
+            found = True
+    if found:
+        print("Städade bort __pycache__ och temporära filer.")
 
 # --- MAIN LOGIC ---
 
@@ -320,63 +286,34 @@ def run_suite(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
     
-    # 1. DISTRIBUTION MODE
     if args.n:
         print(f"\n=== LÄGE 1: FÖRDELNINGSANALYS (ULTRA) ({args.n:,} sim) ===")
-        
         start_t = time.time()
-        
         scores, flags, s0, s1, s2 = run_simulation_parallel(args.n)
-        
         print("Bearbetar data och sparar filer...")
         
-        # Binning logic (vektoriserad i numpy istället för loop för hastighet)
         score_bins = np.bincount(scores, minlength=376)
-        
-        # Binning av sub-kategorier
-        # flags: 0=None, 1=Bonus, 2=Yatzy, 3=Both
-        # Vi använder logical indexing
         mask_bonus = (flags & 1) > 0
         mask_yatzy = (flags & 2) > 0
-        
-        # Skapa 4 grupper
-        # NoYatzy_NoBonus: ~Y & ~B
-        # NoYatzy_YesBonus: ~Y & B
-        # YesYatzy_NoBonus: Y & ~B
-        # YesYatzy_YesBonus: Y & B
         
         bins_ny_nb = np.bincount(scores[~mask_yatzy & ~mask_bonus], minlength=376)
         bins_ny_yb = np.bincount(scores[~mask_yatzy & mask_bonus], minlength=376)
         bins_yy_nb = np.bincount(scores[mask_yatzy & ~mask_bonus], minlength=376)
         bins_yy_yb = np.bincount(scores[mask_yatzy & mask_bonus], minlength=376)
         
-        # CSV 1: Distribution
         with open(out_dir / f"dist_scores_{ts}.csv", "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["Score", "Count_Total", "NoYatzy_NoBonus", "NoYatzy_YesBonus", "YesYatzy_NoBonus", "YesYatzy_YesBonus"])
             for s in range(376):
                 if score_bins[s] > 0:
-                    w.writerow([
-                        s, 
-                        score_bins[s], 
-                        bins_ny_nb[s], 
-                        bins_ny_yb[s], 
-                        bins_yy_nb[s], 
-                        bins_yy_yb[s]
-                    ])
+                    w.writerow([s, score_bins[s], bins_ny_nb[s], bins_ny_yb[s], bins_yy_nb[s], bins_yy_yb[s]])
 
-        # CSV 2: Category Stats
         tot_r = args.n * NUM_CATEGORIES
         with open(out_dir / f"dist_categories_{ts}.csv", "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["Category", "Roll1_Hits", "Roll1_Prob", "Roll2_Hits", "Roll2_Prob", "Roll3_Hits", "Roll3_Prob"])
             for i, cat in enumerate(CATEGORY_NAMES):
-                w.writerow([
-                    cat,
-                    s0[i], s0[i]/tot_r,
-                    s1[i], s1[i]/tot_r,
-                    s2[i], s2[i]/tot_r
-                ])
+                w.writerow([cat, s0[i], s0[i]/tot_r, s1[i], s1[i]/tot_r, s2[i], s2[i]/tot_r])
                 
         elapsed_tot = time.time() - start_t
         mean_score = np.mean(scores)
@@ -390,29 +327,19 @@ def run_suite(args):
         }
         with open(out_dir / f"meta_dist_{ts}.json", "w") as f:
             json.dump(meta, f, indent=2)
-            
         print(f"Klar! Data sparad i {out_dir}")
 
-    # 2. DEVIATION STUDY MODE
     if args.study:
         steps = [int(x) for x in args.study.split(",")]
         reps = args.reps
         print(f"\n=== LÄGE 2: AVVIKELSSEANALYS ({len(steps)} steg, {reps} reps/steg) ===")
-        
         results = []
         summary_data = {cat: {step: [] for step in steps} for cat in CATEGORY_NAMES}
-        
         start_t_study = time.time()
-        
-        # För study mode kör vi mindre batcher ofta, men vi kan fortfarande använda parallellmotorn
-        # för de större stegen.
         
         for step in steps:
             for r in range(reps):
                 print(f"\rKör simulering: Steg {step}, Rep {r+1}/{reps}...", end="")
-                
-                # Kör parallellt (eller seriellt om steget är litet, hanteras av batch logic)
-                # Vi ignorerar score/flags här, behöver bara s0
                 _, _, s0, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//os.cpu_count()))
                 
                 total_rolls = step * NUM_CATEGORIES
@@ -432,20 +359,16 @@ def run_suite(args):
                     summary_data[cat][step].append(dev_val)
 
         print("\nAnalys klar. Sparar data...")
-        
-        # CSV 3: Deviation Detail
         with open(out_dir / f"study_deviation_{ts}.csv", "w", newline="") as f:
             fields = ["Simulations", "Repetition", "Category", "Expected_Pct", "Observed_Pct", "Abs_Deviation_Pct"]
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader()
             w.writerows(results)
 
-        # CSV 4: Deviation Summary
         with open(out_dir / f"study_summary_{ts}.csv", "w", newline="") as f:
             headers = ["Kategori"] + [f"Sim_{s}" for s in steps]
             w = csv.writer(f)
             w.writerow(headers)
-            
             for cat in CATEGORY_NAMES:
                 swe_name = CATEGORY_TRANSLATION.get(cat, cat)
                 row = [swe_name]
@@ -463,19 +386,23 @@ def run_suite(args):
         }
         with open(out_dir / f"meta_study_{ts}.json", "w") as f:
             json.dump(meta_study, f, indent=2)
-
         print(f"Studie sparad i {out_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Yatzy Suite: Ultra-High-Performance")
-    parser.add_argument("--n", type=int, help="Antal simuleringar för fördelningsanalys (t.ex. 1000000)")
-    parser.add_argument("--study", type=str, help="Kommaseparerad lista på antal simuleringssteg (t.ex. '1000,10000')")
+    parser.add_argument("--n", type=int, help="Antal simuleringar för fördelningsanalys")
+    parser.add_argument("--study", type=str, help="Kommaseparerad lista på simuleringssteg")
     parser.add_argument("--reps", type=int, default=5, help="Antal repetitioner per steg i study-mode")
     parser.add_argument("--output", type=str, default="results", help="Mapp för utdata")
+    parser.add_argument("--no-cleanup", action="store_true", help="Behåll __pycache__ efter körning")
     
     args = parser.parse_args()
     
-    if not args.n and not args.study:
-        parser.print_help()
-    else:
-        run_suite(args)
+    try:
+        if not args.n and not args.study:
+            parser.print_help()
+        else:
+            run_suite(args)
+    finally:
+        if not args.no_cleanup:
+            _cleanup_pycache(os.path.dirname(os.path.abspath(__file__)))
