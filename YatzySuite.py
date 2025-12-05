@@ -1,7 +1,6 @@
 import argparse
 import csv
 import json
-import math
 import os
 import time
 import sys
@@ -12,7 +11,6 @@ import numpy as np
 
 # --- CONFIGURATION & CONSTANTS ---
 
-# Strictly require Numba
 try:
     from numba import njit
 except ImportError:
