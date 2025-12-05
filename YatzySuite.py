@@ -232,11 +232,17 @@ def run_suite(args):
         agg_s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
         agg_s2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
         
+        # Sorteringskorgar för distribution
+        # 00: Ingen bonus, ingen yatzy
+        # 01: Bonus, ingen yatzy
+        # 10: Ingen bonus, yatzy
+        # 11: Bonus och yatzy
         score_bins = {
-            "all": np.zeros(376, dtype=np.int64),
-            "yatzy": np.zeros(376, dtype=np.int64),
-            "bonus": np.zeros(376, dtype=np.int64),
-            "yatzy_bonus": np.zeros(376, dtype=np.int64)
+            "total": np.zeros(376, dtype=np.int64),
+            "no_yatzy_no_bonus": np.zeros(376, dtype=np.int64),
+            "no_yatzy_yes_bonus": np.zeros(376, dtype=np.int64),
+            "yes_yatzy_no_bonus": np.zeros(376, dtype=np.int64),
+            "yes_yatzy_yes_bonus": np.zeros(376, dtype=np.int64)
         }
         
         start_t = time.time()
@@ -247,12 +253,21 @@ def run_suite(args):
             sc, fl = _sim_chunk_serial(current_batch, seed, agg_s0, agg_s1, agg_s2)
             
             for s, f in zip(sc, fl):
-                score_bins["all"][s] += 1
-                is_bon = (f & 1)
-                is_ytz = (f & 2)
-                if is_ytz: score_bins["yatzy"][s] += 1
-                if is_bon: score_bins["bonus"][s] += 1
-                if is_ytz and is_bon: score_bins["yatzy_bonus"][s] += 1
+                score_bins["total"][s] += 1
+                
+                # f: Bit 1 = Bonus, Bit 2 = Yatzy.
+                # 0 = 00 = varken eller
+                # 1 = 01 = bonus
+                # 2 = 10 = yatzy
+                # 3 = 11 = båda
+                if f == 0:
+                    score_bins["no_yatzy_no_bonus"][s] += 1
+                elif f == 1:
+                    score_bins["no_yatzy_yes_bonus"][s] += 1
+                elif f == 2:
+                    score_bins["yes_yatzy_no_bonus"][s] += 1
+                elif f == 3:
+                    score_bins["yes_yatzy_yes_bonus"][s] += 1
             
             processed += current_batch
             
@@ -263,13 +278,29 @@ def run_suite(args):
         
         print("\nSimulering klar. Genererar filer...")
         
-        # CSV 1: Distribution
+        # CSV 1: Distribution (Nya kolumner enligt krav)
         with open(out_dir / f"dist_scores_{ts}.csv", "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["Score", "Count_All", "Count_Yatzy", "Count_Bonus", "Count_YatzyBonus"])
+            # Header
+            w.writerow([
+                "Score", 
+                "Count_Total", 
+                "NoYatzy_NoBonus", 
+                "NoYatzy_YesBonus", 
+                "YesYatzy_NoBonus", 
+                "YesYatzy_YesBonus"
+            ])
             for s in range(376):
-                if score_bins["all"][s] > 0:
-                    w.writerow([s, score_bins["all"][s], score_bins["yatzy"][s], score_bins["bonus"][s], score_bins["yatzy_bonus"][s]])
+                # Skriv bara raden om någon poäng finns i totalen för detta score
+                if score_bins["total"][s] > 0:
+                    w.writerow([
+                        s, 
+                        score_bins["total"][s], 
+                        score_bins["no_yatzy_no_bonus"][s], 
+                        score_bins["no_yatzy_yes_bonus"][s], 
+                        score_bins["yes_yatzy_no_bonus"][s], 
+                        score_bins["yes_yatzy_yes_bonus"][s]
+                    ])
                     
         # CSV 2: Category Stats
         with open(out_dir / f"dist_categories_{ts}.csv", "w", newline="") as f:
@@ -286,7 +317,7 @@ def run_suite(args):
                 
         # Metadata (NO SYSTEM INFO)
         elapsed_tot = time.time() - start_t
-        mean_score = float(np.average(np.arange(376), weights=score_bins["all"]))
+        mean_score = float(np.average(np.arange(376), weights=score_bins["total"]))
         
         meta = {
             "mode": "distribution",
