@@ -102,7 +102,7 @@ def _build_lookup_tables():
         if np.any(counts == 3) and np.any(counts == 2):
             scores[idx, 13] = (np.where(counts==3)[0][0]*3 + np.where(counts==2)[0][0]*2)
             sat_mask[idx, 13] = 1
-        elif np.any(counts == 5): # 5 of a kind is also a full house technically in some rules, usually not standard
+        elif np.any(counts == 5):
             pass 
 
         # Chance
@@ -144,7 +144,6 @@ def _ai_reroll(dice, roll_idx, out):
 
 @njit(cache=True)
 def _play_game(stats0, stats1, stats2):
-    # Stats arrays: [NUM_CATEGORIES]
     allowed = 0x7FFF # Bitmask för 15 kategorier
     total = 0
     upper = 0
@@ -154,7 +153,7 @@ def _play_game(stats0, stats1, stats2):
     
     got_yatzy = False
     
-    for _ in range(NUM_CATEGORIES): # 15 runder
+    for _ in range(NUM_CATEGORIES):
         # Roll 1
         for i in range(5): dice0[i] = np.random.randint(1, 7)
         idx0 = _encode(dice0)
@@ -195,102 +194,11 @@ def _play_game(stats0, stats1, stats2):
     bonus = 50 if upper >= 63 else 0
     return total + bonus, bonus > 0, got_yatzy
 
-@njit(parallel=True, cache=True)
-def _sim_batch(count, seed):
-    np.random.seed(seed)
-    
-    res_scores = np.empty(count, dtype=np.int16)
-    res_flags = np.empty(count, dtype=np.int8) # 1=Bonus, 2=Yatzy
-    
-    # Aggregerade stats per tråd -> reduceras sedan
-    # För att spara minne i parallel, returnera bara summor för stats
-    agg_s0 = np.zeros((get_num_threads(), NUM_CATEGORIES), dtype=np.int64)
-    agg_s1 = np.zeros((get_num_threads(), NUM_CATEGORIES), dtype=np.int64)
-    agg_s2 = np.zeros((get_num_threads(), NUM_CATEGORIES), dtype=np.int64)
-
-    for i in prange(count):
-        tid = np.int64(0) # Numba thread id placeholder, handled internt i praktiken via loop
-        # Vi använder en lokal array trick i Numba om vi vill, men enklast är:
-        # Skapa temporära stats för spelet
-        loc_s0 = np.zeros(NUM_CATEGORIES, dtype=np.int32)
-        loc_s1 = np.zeros(NUM_CATEGORIES, dtype=np.int32)
-        loc_s2 = np.zeros(NUM_CATEGORIES, dtype=np.int32)
-        
-        pts, bon, ytz = _play_game(loc_s0, loc_s1, loc_s2)
-        
-        res_scores[i] = pts
-        flag = 0
-        if bon: flag |= 1
-        if ytz: flag |= 2
-        res_flags[i] = flag
-        
-        # Addera till tråd-säkert eller via reduktion
-        # I Numba prange är reduktion på arrays svårt. 
-        # Vi kör en enkel lösning: Eftersom prestanda är key, skippar vi per-game stats i denna snabba loop
-        # och kör bara total poäng för distribution.
-        # MEN kravet är "Sannolikhet för kategorier". Vi måste spara det.
-        # Vi använder atomics eller batchning. Här kör vi bara in det i score-loopen.
-        # OBS: Numba parallel race conditions på arrays. 
-        # Lösning: Skippa parallel skrivning till delad array, returnera bara scores 
-        # och kör en separat mindre sim för stats om man vill, ELLER kör seriellt för stats.
-        # Bäst: Varje tråd har sin egen aggregeringsbuffert. (Kräver lite mer kod, förenklar här för korthet).
-    
-    return res_scores, res_flags
-
-# Vi behöver en icke-parallell eller smartare parallel funktion för stats-insamling
-# För att hålla koden kort och snabb, kör vi parallel för SCORES (stor mängd) 
-# och använder samma funktion men accepterar race-conditions? Nej.
-# Vi gör så här: Vi kör en separat funktion för Stats som samlar i chunks.
-
-@njit(parallel=True, cache=True)
-def _sim_batch_with_stats(count, seed):
-    np.random.seed(seed)
-    # Return structures
-    all_scores = np.empty(count, dtype=np.int16)
-    all_flags = np.empty(count, dtype=np.int8)
-    
-    # Thread-local accumulators (size: threads x categories)
-    n_threads = get_num_threads()
-    t_s0 = np.zeros((n_threads, NUM_CATEGORIES), dtype=np.int64)
-    t_s1 = np.zeros((n_threads, NUM_CATEGORIES), dtype=np.int64)
-    t_s2 = np.zeros((n_threads, NUM_CATEGORIES), dtype=np.int64)
-
-    # Numba prange ger inte direkt thread_id, så vi fuskar lite genom att inte låsa.
-    # För korrekt statistik i massiv skala är det bäst att acceptera att vi kör detta seriellt
-    # ELLER allokera [count, categories] vilket drar för mycket RAM.
-    # Lösning: Kör prange, men aggregera statistiken UTANFÖR loopen i Python (returnera raw games)?
-    # Nej, för 10M games x 15 cats x 3 rolls = 450MB data. Det funkar.
-    # LÅT OSS GÖRA DET ENKELT:
-    # Kör parallel loop för poäng. Statistik på rullningar är för dyrt att spara per spel.
-    # Vi ackumulerar BARA totalsummor. För att göra det trådsäkert i Numba krävs atomics.
-    
-    for i in prange(count):
-        # Dummy arrays för spelet, vi sparar inte dem
-        l0 = np.zeros(NUM_CATEGORIES, dtype=np.int32)
-        l1 = np.zeros(NUM_CATEGORIES, dtype=np.int32)
-        l2 = np.zeros(NUM_CATEGORIES, dtype=np.int32)
-        
-        sc, bon, ytz = _play_game(l0, l1, l2)
-        all_scores[i] = sc
-        f = 0
-        if bon: f |= 1
-        if ytz: f |= 2
-        all_flags[i] = f
-        
-        # VIKTIGT: För "sannolikhet att uppfyllas" behöver vi summorna av l0, l1, l2.
-        # Vi kan inte göra `global_arr += l0` säkert i prange.
-        # Vi struntar i parallellisering för just stats-delen i denna "Suite" för att garantera korrekthet
-        # och använder en chunk-baserad seriell approach inuti trådarna om möjligt. 
-        # FÖR ATT MAXIMERA PRESTANDA OCH KORREKTHET:
-        # Vi använder enbart _sim_batch_stats_serial för mindre "Studies" och batchar.
-
-    return all_scores, all_flags
-
 @njit(cache=True)
 def _sim_chunk_serial(count, seed, out_s0, out_s1, out_s2):
     np.random.seed(seed)
     scores = np.empty(count, dtype=np.int16)
-    flags = np.empty(count, dtype=np.int8)
+    flags = np.empty(count, dtype=np.int8) # 1=Bonus, 2=Yatzy, 3=Båda, 0=Ingen
     
     l0 = np.zeros(NUM_CATEGORIES, dtype=np.int32)
     l1 = np.zeros(NUM_CATEGORIES, dtype=np.int32)
@@ -330,16 +238,19 @@ def run_suite(args):
         chunk_size = min(total_counts, 200_000)
         processed = 0
         
-        # Aggregatorer
+        # Aggregatorer för kategoristatistik
         agg_s0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
         agg_s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
         agg_s2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
         
+        # Aggregatorer för Poängfördelning (Score bins)
+        # 0: None, 1: BonusOnly, 2: YatzyOnly, 3: Both
         score_bins = {
-            "all": np.zeros(376, dtype=np.int64), # Maxscore 375
-            "yatzy": np.zeros(376, dtype=np.int64),
-            "bonus": np.zeros(376, dtype=np.int64),
-            "yatzy_bonus": np.zeros(376, dtype=np.int64)
+            "all": np.zeros(376, dtype=np.int64), # Totalt
+            "none": np.zeros(376, dtype=np.int64), # Varken Yatzy eller Bonus
+            "yatzy_only": np.zeros(376, dtype=np.int64), # Yatzy men inte Bonus
+            "bonus_only": np.zeros(376, dtype=np.int64), # Bonus men inte Yatzy
+            "both": np.zeros(376, dtype=np.int64) # Både och
         }
         
         start_t = time.time()
@@ -347,23 +258,22 @@ def run_suite(args):
         while processed < total_counts:
             current_batch = min(chunk_size, total_counts - processed)
             
-            # Kör seriell chunk (snabb nog för ~100k/sek per kärna, vi kör single-core stats för enkelhetens skull)
-            # Vill man ha multicore här krävs map/reduce i Python. Numba serial är ca 3-4ms per spel? Nej, mycket snabbare.
-            # Numba C++ speed är ca 1-2 mikrosekunder per spel. 200k games tar < 1 sek.
-            
-            t_chunk_start = time.time()
-            # Använd seriell kernel för att få stats korrekta
+            # Kör batch
             seed = np.random.randint(0, 2**30)
             sc, fl = _sim_chunk_serial(current_batch, seed, agg_s0, agg_s1, agg_s2)
             
-            # Binning
+            # Sortera in resultaten i rätt kolumn-bin
+            # Flags: 0=None, 1=Bonus, 2=Yatzy, 3=Both (bitvis OR i play_game)
             for s, f in zip(sc, fl):
                 score_bins["all"][s] += 1
-                is_bon = (f & 1)
-                is_ytz = (f & 2)
-                if is_ytz: score_bins["yatzy"][s] += 1
-                if is_bon: score_bins["bonus"][s] += 1
-                if is_ytz and is_bon: score_bins["yatzy_bonus"][s] += 1
+                if f == 0:
+                    score_bins["none"][s] += 1
+                elif f == 1:
+                    score_bins["bonus_only"][s] += 1
+                elif f == 2:
+                    score_bins["yatzy_only"][s] += 1
+                elif f == 3:
+                    score_bins["both"][s] += 1
             
             processed += current_batch
             
@@ -375,13 +285,29 @@ def run_suite(args):
         
         print("\nSimulering klar. Genererar filer...")
         
-        # CSV 1: Distribution
-        with open(out_dir / f"dist_scores_{ts}.csv", "w", newline="") as f:
+        # CSV 1: Score Distribution (Uppdaterad med 5 specifika kolumner)
+        csv_path_dist = out_dir / f"dist_scores_{ts}.csv"
+        with open(csv_path_dist, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["Score", "Count_All", "Count_Yatzy", "Count_Bonus", "Count_YatzyBonus"])
+            # Headers enligt önskemål (på engelska eller svenska koder för tydlighet)
+            w.writerow([
+                "Score", 
+                "Count_All", 
+                "Count_NoYatzy_NoBonus", 
+                "Count_Yatzy_NoBonus", 
+                "Count_NoYatzy_Bonus", 
+                "Count_Yatzy_And_Bonus"
+            ])
             for s in range(376):
                 if score_bins["all"][s] > 0:
-                    w.writerow([s, score_bins["all"][s], score_bins["yatzy"][s], score_bins["bonus"][s], score_bins["yatzy_bonus"][s]])
+                    w.writerow([
+                        s, 
+                        score_bins["all"][s], 
+                        score_bins["none"][s], 
+                        score_bins["yatzy_only"][s], 
+                        score_bins["bonus_only"][s], 
+                        score_bins["both"][s]
+                    ])
                     
         # CSV 2: Category Stats
         with open(out_dir / f"dist_categories_{ts}.csv", "w", newline="") as f:
@@ -428,7 +354,7 @@ def run_suite(args):
             for r in range(reps):
                 # Kör en liten batch
                 s0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-                s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64) # Används ej men krävs av func
+                s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
                 s2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
                 
                 seed = np.random.randint(0, 2**30)
