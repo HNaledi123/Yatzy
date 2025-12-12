@@ -296,6 +296,23 @@ def _play_game_optimized(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndar
 
 @njit(nogil=True)
 def _worker_sim_batch(count: int, seed: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Simulates a batch of Yatzy games in a single, isolated thread.
+
+    This function is the target for the parallel ThreadPoolExecutor. It initializes its
+    own random number generator from a given seed to ensure thread safety and
+    reproducibility. It then runs a specified number of games and aggregates their results.
+
+    Args:
+        count: The number of games to simulate in this batch.
+        seed: A seed for the local random number generator.
+
+    Returns:
+        A tuple containing the results for the batch:
+        - (np.ndarray): An array of final scores for each game.
+        - (np.ndarray): An array of bit flags for each game (bonus, yatzy).
+        - (np.ndarray, np.ndarray, np.ndarray): Aggregated category satisfaction counts for rolls 1, 2, and 3.
+    """
     rng = np.random.default_rng(seed)
     scores_out = np.empty(count, dtype=np.int16)
     flags_out = np.empty(count, dtype=np.int8)
@@ -321,6 +338,23 @@ def _worker_sim_batch(count: int, seed: int) -> Tuple[np.ndarray, np.ndarray, np
 # --- DRIVER LOGIC ---
 
 def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: np.random.Generator = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Manages the parallel execution of the Yatzy simulation.
+
+    This function orchestrates the simulation by splitting the total number of games
+    into smaller batches and distributing them across a ThreadPoolExecutor. It
+    dynamically calculates a reasonable batch size if one is not provided.
+    It aggregates results from all worker threads and displays real-time progress.
+
+    Args:
+        total_count: The total number of games to simulate.
+        batch_size: The number of games to simulate per worker batch.
+        main_rng: The main random number generator, used to seed the workers.
+
+    Returns:
+        A tuple containing the aggregated results from all simulations:
+        - Final scores, flags, and category satisfaction counts for rolls 1, 2, and 3.
+    """
     local_rng = main_rng if main_rng is not None else np.random.default_rng()
     if batch_size is None:
         cpu_count = os.cpu_count() or 4
@@ -376,6 +410,13 @@ def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: 
 # --- MAIN EXECUTION ---
 
 def run_suite(args):
+    """
+    Main driver for the Yatzy simulation suite.
+
+    Parses command-line arguments and executes the requested simulation mode(s),
+    either a distribution analysis or a deviation study. Handles file I/O for
+    saving results and metadata.
+    """
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
