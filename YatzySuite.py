@@ -295,77 +295,6 @@ def _play_game_optimized(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndar
     return np.int16(total + bonus), bonus > 0, got_yatzy
 
 @njit(nogil=True)
-def _play_game_score_only(d0: np.ndarray, d1: np.ndarray, d2: np.ndarray) -> Tuple[int, bool, bool]:
-    """
-    Simulates one full game of Yatzy, optimized for score calculation only.
-    This version does not collect category satisfaction statistics, leading to
-    higher performance. It is used for the main distribution analysis.
-    """
-    allowed = ALL_CATEGORIES_MASK
-    total = 0
-    upper = 0
-    got_yatzy = False
-    
-    for _ in range(NUM_CATEGORIES):
-        d0[:] = np.random.randint(1, 7, size=5).astype(np.int8)
-        idx0 = _encode(d0)
-        _reroll(d0, idx0, d1, np.random)
-        idx1 = _encode(d1)
-        _reroll(d1, idx1, d2, np.random)
-        idx2 = _encode(d2)
-        
-        best_sc = -1
-        best_id = -1
-        scores = TBL_SCORES[idx2]
-        
-        for i in range(NUM_CATEGORIES):
-            cat = TBL_PRIO[i]
-            if (allowed >> cat) & 1:
-                s = scores[cat]
-                if s > best_sc:
-                    best_sc = s
-                    best_id = cat
-        total += best_sc
-        if best_id < 6: upper += best_sc
-        if best_id == YATZY_IDX and best_sc > 0: got_yatzy = True
-        allowed &= ~(1 << best_id)
-        
-    bonus = UPPER_SECTION_BONUS_SCORE if upper >= UPPER_SECTION_BONUS_THRESHOLD else 0
-    return np.int16(total + bonus), bonus > 0, got_yatzy
-
-@njit(nogil=True)
-def _play_game_ultra_performance(d0: np.ndarray, d1: np.ndarray, d2: np.ndarray) -> int:
-    """
-    Simulates one game returning only the final score as an integer. This is the
-    fastest implementation, mirroring the legacy `YatzyUltra.py` script, by
-    avoiding all tuple creation/unpacking overhead within the parallel loop.
-    """
-    allowed = ALL_CATEGORIES_MASK
-    total = 0
-    upper = 0
-    
-    for _ in range(NUM_CATEGORIES):
-        d0[:] = np.random.randint(1, 7, size=5).astype(np.int8)
-        idx0 = _encode(d0)
-        _reroll(d0, idx0, d1, np.random)
-        idx1 = _encode(d1)
-        _reroll(d1, idx1, d2, np.random)
-        idx2 = _encode(d2)
-        
-        best_sc = -1
-        best_id = -1
-        scores = TBL_SCORES[idx2]
-        for i in range(NUM_CATEGORIES):
-            cat = TBL_PRIO[i]
-            if (allowed >> cat) & 1:
-                s = scores[cat]
-                if s > best_sc: best_sc, best_id = s, cat
-        total += best_sc
-        if best_id < 6: upper += best_sc
-        allowed &= ~(1 << best_id)
-    return np.int16(total + (UPPER_SECTION_BONUS_SCORE if upper >= UPPER_SECTION_BONUS_THRESHOLD else 0))
-
-@njit(nogil=True)
 def _simulation_core(count: int, rng) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     The core, Numba-optimized simulation loop.
@@ -414,54 +343,6 @@ def _simulation_core_parallel(count: int, seed: int) -> Tuple[np.ndarray, np.nda
     for i in prange(count):
         # Thread-local arrays for dice and stats
         d0, d1, d2 = np.empty((3, 5), dtype=np.int8)
-        sc, bon, ytz = _play_game_score_only(d0, d1, d2)
-        scores_out[i] = sc
-        flags_out[i] = (1 if bon else 0) | (2 if ytz else 0)
-    # Stats are not collected in this high-performance version
-    return scores_out, flags_out, agg_s0, agg_s1, agg_s2
-
-@njit(parallel=True, nogil=True)
-def _simulation_core_parallel_ultra(count: int, seed: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    The fastest parallel simulation core. It calls a function that only returns
-    the integer score and reconstructs the flags post-simulation. This avoids
-    costly tuple operations inside the prange loop.
-    """
-    np.random.seed(seed)
-    scores_out = np.empty(count, dtype=np.int16)
-    flags_out = np.empty(count, dtype=np.int8)
-    agg_s0, agg_s1, agg_s2 = np.zeros((3, NUM_CATEGORIES), dtype=np.int64)
-
-    for i in prange(count):
-        d0, d1, d2 = np.empty((3, 5), dtype=np.int8)
-        scores_out[i] = _play_game_ultra_performance(d0, d1, d2)
-
-    # Post-loop flag reconstruction (much faster than in-loop)
-    for i in range(count):
-        sc, bon, ytz = _play_game_score_only(np.empty(5, dtype=np.int8), np.empty(5, dtype=np.int8), np.empty(5, dtype=np.int8))
-        # This is a bit of a trick. We don't have the bonus/yatzy flags from the ultra-perf
-        # function. We can either re-run a single game to get them (slow) or just accept
-        # that for the ultra-fast path, we only get scores. The user confirmed the CSV still
-        # needs the columns, so we must get the flags. The most robust way is to use the
-        # slightly slower `_play_game_score_only` when flags are needed.
-        # Let's revert to the previous `_simulation_core_parallel` and optimize it.
-    return scores_out, flags_out, agg_s0, agg_s1, agg_s2
-
-@njit(parallel=True, nogil=True)
-def _simulation_core_parallel_with_stats(count: int, seed: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    A parallel simulation loop that includes statistics collection.
-    This version is used for the deviation study, where performance is less
-    critical than collecting the category satisfaction data.
-    """
-    np.random.seed(seed)
-    scores_out = np.empty(count, dtype=np.int16)
-    flags_out = np.empty(count, dtype=np.int8)
-    agg_s0, agg_s1, agg_s2 = np.zeros((3, NUM_CATEGORIES), dtype=np.int64)
-
-    for i in prange(count):
-        # Thread-local arrays for dice and stats
-        d0, d1, d2 = np.empty((3, 5), dtype=np.int8)
         l_s0, l_s1, l_s2 = np.zeros((3, NUM_CATEGORIES), dtype=np.int64)
         sc, bon, ytz = _play_game_optimized(l_s0, l_s1, l_s2, d0, d1, d2, np.random)
         scores_out[i] = sc
@@ -492,8 +373,7 @@ def _worker_sim_batch(count: int, seed: int) -> Tuple[np.ndarray, np.ndarray, np
 
 # --- DRIVER LOGIC ---
 
-def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: np.random.Generator = None, use_numba_parallel: bool = True, collect_stats: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: np.random.Generator = None, use_numba_parallel: bool = True, collect_stats: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: np.random.Generator = None, use_numba_parallel: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Manages the parallel execution of the Yatzy simulation.
 
@@ -507,7 +387,6 @@ def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: 
         batch_size: The number of games to simulate per worker batch.
         main_rng: The main random number generator, used to seed the workers.
         use_numba_parallel: If True, use Numba's `parallel=True` model.
-        collect_stats: If False, use a faster simulation core that only returns scores.
 
     Returns:
         A tuple containing the aggregated results from all simulations:
@@ -532,14 +411,9 @@ def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: 
     if use_numba_parallel:
         remaining = total_count
         while remaining > 0:
-            sim_func = (
-                _simulation_core_parallel_with_stats if collect_stats
-                else _simulation_core_parallel
-            )
-
             count = min(batch_size, remaining)
             seed = local_rng.integers(0, 2**30)
-            res_scores, res_flags, r_s0, r_s1, r_s2 = sim_func(count, seed)
+            res_scores, res_flags, r_s0, r_s1, r_s2 = _simulation_core_parallel(count, seed)
             agg_s0, agg_s1, agg_s2 = agg_s0 + r_s0, agg_s1 + r_s1, agg_s2 + r_s2
             all_scores.append(res_scores)
             all_flags.append(res_flags)
@@ -599,7 +473,7 @@ def run_suite(args):
     if args.n:
         print(f"\n=== MODE 1: DISTRIBUTION ANALYSIS ({args.n:,} sim) ===")
         start_t = time.time()        
-        scores, flags, s0, s1, s2 = run_simulation_parallel(args.n, main_rng=main_rng, collect_stats=False)
+        scores, flags, s0, s1, s2 = run_simulation_parallel(args.n, main_rng=main_rng)
         print("Processing data...")
         
         score_bins = np.bincount(scores, minlength=376)
@@ -646,15 +520,13 @@ def run_suite(args):
         results = []
         summary_data = {cat: {step: [] for step in steps} for cat in CATEGORY_NAMES}
         start_t_study = time.time()
-        all_stats = []
         
         for step in steps:
             for r in range(reps):
                 print(f"\rRunning simulation: Step {step}, Rep {r+1}/{reps}...", end="")
-                _, _, s0, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)), main_rng=main_rng, collect_stats=True)
+                _, _, s0, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)), main_rng=main_rng)
                 
                 total_rolls = step * NUM_CATEGORIES
-                all_stats.append(s0)
                 obs_probs = s0 / total_rolls
                 abs_devs = np.abs(obs_probs - EXPECTED_PROBS) * 100 
                 
@@ -688,16 +560,6 @@ def run_suite(args):
                     avg_dev = sum(devs) / len(devs) if devs else 0
                     row.append(f"{avg_dev:.4f}")
                 w.writerow(row)
-
-        # Save category satisfaction stats, now that they've been collected
-        if all_stats:
-            final_stats = np.sum(np.array(all_stats), axis=0)
-            total_rolls_study = sum(steps) * reps * NUM_CATEGORIES
-            with open(out_dir / f"study_categories_{ts}.csv", "w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["Category", "Roll1_Hits", "Roll1_Prob"])
-                for i, cat in enumerate(CATEGORY_NAMES):
-                    w.writerow([cat, final_stats[i], final_stats[i] / total_rolls_study])
 
         meta_study = {
             "mode": "deviation_study",
