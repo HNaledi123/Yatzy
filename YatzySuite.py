@@ -373,7 +373,7 @@ def _worker_sim_batch(count: int, seed: int) -> Tuple[np.ndarray, np.ndarray, np
 
 # --- DRIVER LOGIC ---
 
-def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: np.random.Generator = None, use_numba_parallel: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: np.random.Generator = None, use_numba_parallel: bool = True, result_callback=None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Manages the parallel execution of the Yatzy simulation.
 
@@ -387,10 +387,11 @@ def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: 
         batch_size: The number of games to simulate per worker batch.
         main_rng: The main random number generator, used to seed the workers.
         use_numba_parallel: If True, use Numba's `parallel=True` model.
+        result_callback: An optional function to call with the results of each batch.
 
     Returns:
         A tuple containing the aggregated results from all simulations:
-        - Final scores, flags, and category satisfaction counts for rolls 1, 2, and 3.
+        - Aggregated category satisfaction counts for rolls 1, 2, and 3.
     """
     local_rng = main_rng if main_rng is not None else np.random.default_rng()
     if batch_size is None:
@@ -403,9 +404,6 @@ def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: 
     agg_s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     agg_s2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     
-    all_scores = []
-    all_flags = []
-    
     start_time = time.time()
     
     if use_numba_parallel:
@@ -415,9 +413,8 @@ def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: 
             seed = local_rng.integers(0, 2**30)
             res_scores, res_flags, r_s0, r_s1, r_s2 = _simulation_core_parallel(count, seed)
             agg_s0, agg_s1, agg_s2 = agg_s0 + r_s0, agg_s1 + r_s1, agg_s2 + r_s2
-            all_scores.append(res_scores)
-            all_flags.append(res_flags)
             remaining -= count
+            if result_callback: result_callback(res_scores, res_flags)
             completed = total_count - remaining
             elapsed = time.time() - start_time
             rate = completed / elapsed if elapsed > 0 else 0
@@ -438,9 +435,8 @@ def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: 
             for f in concurrent.futures.as_completed(futures):
                 res_scores, res_flags, r_s0, r_s1, r_s2 = f.result()
                 agg_s0, agg_s1, agg_s2 = agg_s0 + r_s0, agg_s1 + r_s1, agg_s2 + r_s2
-                all_scores.append(res_scores)
-                all_flags.append(res_flags)
                 completed += len(res_scores)
+                if result_callback: result_callback(res_scores, res_flags)
                 elapsed = time.time() - start_time
                 rate = completed / elapsed if elapsed > 0 else 0
                 eta = (total_count - completed) / rate if rate > 0 else 0
@@ -448,10 +444,8 @@ def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: 
                 print(f"\rSimulating: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta:3.0f}s ", end="")
             
     print() # Newline after loop
-    final_scores = np.concatenate(all_scores)
-    final_flags = np.concatenate(all_flags)
     
-    return final_scores, final_flags, agg_s0, agg_s1, agg_s2
+    return agg_s0, agg_s1, agg_s2
 
 # --- MAIN EXECUTION ---
 
