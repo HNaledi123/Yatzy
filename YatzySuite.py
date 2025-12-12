@@ -1,3 +1,20 @@
+"""
+Yatzy Suite: A High-Performance Monte Carlo Simulation Tool
+
+This script is designed to run a large number of simulated Yatzy games to analyze
+statistical outcomes, such as score distributions and the probability of achieving
+certain categories. It serves as the data generation engine for the research report.
+
+Methodology:
+The simulation employs the Monte Carlo method. Each game is played by a simple,
+deterministic AI agent. To achieve high performance suitable for millions of
+simulations, the script heavily relies on two key optimizations:
+
+1.  **Lookup Tables**: All 7,776 possible outcomes of a 5-dice roll are pre-calculated
+    at startup. This includes scores for every category and a basic re-roll strategy.
+2.  **Numba JIT Compilation**: The core game-playing logic is Just-In-Time compiled
+    using Numba, which translates Python code into highly efficient machine code.
+"""
 import argparse
 import csv
 import json
@@ -5,6 +22,7 @@ import os
 import time
 import sys
 import concurrent.futures
+from typing import Tuple
 from pathlib import Path
 
 # --- DEPENDENCY CHECKS ---
@@ -20,7 +38,7 @@ except ImportError:
 
 # --- CONFIGURATION & CONSTANTS ---
 
-CATEGORY_NAMES = [
+CATEGORY_NAMES: list[str] = [
     "Aces", "Twos", "Threes", "Fours", "Fives", "Sixes",
     "One Pair", "Three of a Kind", "Four of a Kind", "Yatzy",
     "Two Pairs", "Small Straight", "Large Straight", "Full House", "Chance"
@@ -28,11 +46,19 @@ CATEGORY_NAMES = [
 
 NUM_CATEGORIES = 15
 # Mapping strict logic indices
-OF_A_KIND_TO_IDX = {2: 6, 3: 7, 4: 8, 5: 9}
+OF_A_KIND_TO_IDX: dict[int, int] = {2: 6, 3: 7, 4: 8, 5: 9}
 YATZY_IDX = 9
-ROLL_STATE_COUNT = 6 ** 5
+ROLL_STATE_COUNT = 7776 # 6^5
 
-# Exact probabilities based on 7776 outcomes (6^5)
+# Game Rule Constants
+UPPER_SECTION_BONUS_THRESHOLD = 63
+UPPER_SECTION_BONUS_SCORE = 50
+YATZY_SCORE = 50
+SMALL_STRAIGHT_SCORE = 15 # 1 + 2 + 3 + 4 + 5
+LARGE_STRAIGHT_SCORE = 20 # 2 + 3 + 4 + 5 + 6
+ALL_CATEGORIES_MASK = (1 << NUM_CATEGORIES) - 1 # Creates a mask with 15 ones in binary
+
+# Exact probabilities of category requirements being fulfilled based on 7776 outcomes (6^5)
 EXPECTED_PROBS = np.array([
     4651 / ROLL_STATE_COUNT,  # Aces
     4651 / ROLL_STATE_COUNT,  # Twos
@@ -53,7 +79,22 @@ EXPECTED_PROBS = np.array([
 
 # --- LOOKUP TABLE GENERATION ---
 
-def _build_lookup_tables():
+def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Pre-calculates all possible outcomes for a single 5-dice roll.
+
+    This function iterates through all 7,776 (6^5) combinations of 5 dice. For each
+    combination, it assigns an id and then calculates the score for all 15 Yatzy categories 
+    and determines a basic re-roll strategy. This avoids costly recalculations during the simulation.
+
+    Returns:
+        A tuple containing five numpy arrays:
+        - scores: (7776, 15) array of scores for each roll and category.
+        - sat_mask: (7776, 15) boolean mask indicating if a roll satisfies a category.
+        - keep_val: (7776,) value of the dice to keep.
+        - keep_cnt: (7776,) amount of dice with the selected value.
+        - priority: (15,) array defining the category selection order. Lower is prioritised.
+    """
     from itertools import product
     scores = np.zeros((ROLL_STATE_COUNT, NUM_CATEGORIES), dtype=np.int16)
     sat_mask = np.zeros((ROLL_STATE_COUNT, NUM_CATEGORIES), dtype=np.uint8)
@@ -66,7 +107,6 @@ def _build_lookup_tables():
     for idx, dice in enumerate(product(range(1, 7), repeat=5)):
         d_arr = np.array(dice, dtype=np.int8)
         counts = np.bincount(d_arr, minlength=7)
-        s_dice = np.sort(d_arr)
         d_sum = d_arr.sum()
 
         # Upper Section (Aces through Sixes)
@@ -78,7 +118,7 @@ def _build_lookup_tables():
         for k, p_idx in OF_A_KIND_TO_IDX.items():
             if k == 5: 
                 if np.any(counts[1:] >= 5):
-                    scores[idx, p_idx] = 50
+                    scores[idx, p_idx] = YATZY_SCORE
                     sat_mask[idx, p_idx] = 1
             else:
                 for f in range(6, 0, -1):
@@ -94,12 +134,12 @@ def _build_lookup_tables():
             sat_mask[idx, 10] = 1
             
         # Straights
-        u_vals = np.unique(s_dice)
+        u_vals = np.unique(d_arr)
         if np.array_equal(u_vals, [1,2,3,4,5]): 
-            scores[idx, 11] = 15
+            scores[idx, 11] = SMALL_STRAIGHT_SCORE
             sat_mask[idx, 11] = 1
         if np.array_equal(u_vals, [2,3,4,5,6]): 
-            scores[idx, 12] = 20
+            scores[idx, 12] = LARGE_STRAIGHT_SCORE
             sat_mask[idx, 12] = 1
             
         # Full House
@@ -131,14 +171,39 @@ print("Done.")
 # --- OPTIMIZED NUMBA FUNCTIONS ---
 
 @njit(nogil=True)
-def _encode(dice):
+def _encode(dice: np.ndarray) -> int:
+    """
+    Encodes a 5-dice roll into a unique integer index from 0 to 7775.
+
+    This is effectively a base-6 conversion, where each die position represents a
+    digit. This allows for instant lookup in the pre-calculated tables.
+    Example: (1,1,1,1,1) -> 0, (6,6,6,6,6) -> 7775.
+
+    Args:
+        dice: A numpy array of 5 integers representing the dice roll.
+
+    Returns:
+        The unique integer index for the roll.
+    """
     k = 0
     for i in range(5): 
         k = k * 6 + (dice[i] - 1)
     return k
 
 @njit(nogil=True)
-def _ai_reroll(dice, roll_idx, out):
+def _reroll(dice: np.ndarray, roll_idx: int, out: np.ndarray, rng):
+    """
+    Performs a re-roll based on a pre-calculated "greedy" strategy.
+
+    The strategy is to keep the largest group of identical dice with the highest
+    face value and re-roll the rest. The decision is looked up from the TBL_KEEP_* tables.
+
+    Args:
+        dice: The current 5-dice roll.
+        roll_idx: The encoded index of the current roll.
+        out: A pre-allocated array to store the new roll result.
+        rng: The Numba-compatible random number generator instance.
+    """
     cnt = TBL_KEEP_CNT[roll_idx]
     if cnt == 5:
         for i in range(5):
@@ -149,19 +214,39 @@ def _ai_reroll(dice, roll_idx, out):
     for i in range(cnt): 
         out[i] = val
     for i in range(cnt, 5): 
-        out[i] = np.random.randint(1, 7)
+        out[i] = rng.integers(1, 7)
 
 @njit(nogil=True)
-def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
-    allowed = 0x7FFF 
+def _play_game_optimized(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndarray,
+                         d0: np.ndarray, d1: np.ndarray, d2: np.ndarray,
+                         rng) -> Tuple[int, bool, bool]:
+    """
+    Simulates one full game of Yatzy.
+
+    This function simulates all 15 rounds of a game. In each round, it performs
+    up to three rolls, uses the strategy to make re-roll decisions, and selects the best
+    category to score based the a fixed priority list.
+
+    Args:
+        stats0, stats1, stats2: Arrays to accumulate category satisfaction counts
+                                for each of the three possible rolls in a turn.
+        d0, d1, d2: Pre-allocated arrays to hold dice values for the three rolls.
+        rng: The Numba-compatible random number generator instance.
+
+    Returns:
+        A tuple containing:
+        - The final total score for the game.
+        - A boolean indicating if the upper section bonus was achieved.
+        - A boolean indicating if a Yatzy was scored.
+    """
+    allowed = ALL_CATEGORIES_MASK
     total = 0
     upper = 0
     got_yatzy = False
     
     for _ in range(NUM_CATEGORIES): 
         # Roll 1
-        for i in range(5): 
-            d0[i] = np.random.randint(1, 7)
+        d0[:] = rng.integers(1, 7, size=5, dtype=np.int8)
         idx0 = _encode(d0)
         
         row0 = TBL_SAT[idx0]
@@ -169,14 +254,14 @@ def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
             stats0[c] += row0[c]
         
         # Roll 2
-        _ai_reroll(d0, idx0, d1)
+        _reroll(d0, idx0, d1, rng)
         idx1 = _encode(d1)
         row1 = TBL_SAT[idx1]
         for c in range(NUM_CATEGORIES): 
             stats1[c] += row1[c]
         
         # Roll 3
-        _ai_reroll(d1, idx1, d2)
+        _reroll(d1, idx1, d2, rng)
         idx2 = _encode(d2)
         row2 = TBL_SAT[idx2]
         for c in range(NUM_CATEGORIES): 
@@ -186,10 +271,13 @@ def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
         best_id = -1
         scores = TBL_SCORES[idx2]
         
+        # Category selection: Iterate through the fixed priority list (TBL_PRIO)
+        # and pick the highest-scoring available category.
         for i in range(NUM_CATEGORIES):
             cat = TBL_PRIO[i]
+            # Check if the category 'cat' is available using a bitwise AND.
             if (allowed >> cat) & 1:
-                s = scores[cat]
+                s = scores[cat] # Get the score for this category from the lookup table.
                 if s > best_sc:
                     best_sc = s
                     best_id = cat
@@ -200,14 +288,15 @@ def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
         if best_id == YATZY_IDX and best_sc > 0: 
             got_yatzy = True
         
+        # Mark the chosen category as used by flipping its bit in the 'allowed' mask.
         allowed &= ~(1 << best_id)
         
-    bonus = 50 if upper >= 63 else 0
+    bonus = UPPER_SECTION_BONUS_SCORE if upper >= UPPER_SECTION_BONUS_THRESHOLD else 0
     return total + bonus, bonus > 0, got_yatzy
 
 @njit(nogil=True)
-def _worker_sim_batch(count, seed):
-    np.random.seed(seed)
+def _worker_sim_batch(count: int, seed: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
     scores_out = np.empty(count, dtype=np.int16)
     flags_out = np.empty(count, dtype=np.int8)
     
@@ -220,7 +309,7 @@ def _worker_sim_batch(count, seed):
     d2 = np.empty(5, dtype=np.int8)
     
     for i in range(count):
-        sc, bon, ytz = _play_game_optimized(l_s0, l_s1, l_s2, d0, d1, d2)
+        sc, bon, ytz = _play_game_optimized(l_s0, l_s1, l_s2, d0, d1, d2, rng)
         scores_out[i] = sc
         f = 0
         if bon: f |= 1
@@ -231,7 +320,8 @@ def _worker_sim_batch(count, seed):
 
 # --- DRIVER LOGIC ---
 
-def run_simulation_parallel(total_count, batch_size=None):
+def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: np.random.Generator = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    local_rng = main_rng if main_rng is not None else np.random.default_rng()
     if batch_size is None:
         cpu_count = os.cpu_count() or 4
         target_chunks = cpu_count * 4
@@ -252,7 +342,7 @@ def run_simulation_parallel(total_count, batch_size=None):
         remaining = total_count
         while remaining > 0:
             count = min(batch_size, remaining)
-            seed = np.random.randint(0, 2**30)
+            seed = local_rng.integers(0, 2**30)
             futures.append(executor.submit(_worker_sim_batch, count, seed))
             remaining -= count
             
@@ -289,12 +379,14 @@ def run_suite(args):
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
+
+    main_rng = np.random.default_rng(args.seed)
     
     # Mode 1: Distribution Analysis
     if args.n:
         print(f"\n=== MODE 1: DISTRIBUTION ANALYSIS ({args.n:,} sim) ===")
-        start_t = time.time()
-        scores, flags, s0, s1, s2 = run_simulation_parallel(args.n)
+        start_t = time.time()        
+        scores, flags, s0, s1, s2 = run_simulation_parallel(args.n, main_rng=main_rng)
         print("Processing data...")
         
         score_bins = np.bincount(scores, minlength=376)
@@ -324,6 +416,7 @@ def run_suite(args):
         meta = {
             "mode": "distribution",
             "count": args.n,
+            "seed": args.seed,
             "elapsed_sec": elapsed_tot,
             "mean_score": float(np.mean(scores)),
             "performance": f"{args.n/elapsed_tot:.0f} games/sec"
@@ -344,7 +437,7 @@ def run_suite(args):
         for step in steps:
             for r in range(reps):
                 print(f"\rRunning simulation: Step {step}, Rep {r+1}/{reps}...", end="")
-                _, _, s0, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)))
+                _, _, s0, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)), main_rng=main_rng)
                 
                 total_rolls = step * NUM_CATEGORIES
                 obs_probs = s0 / total_rolls
@@ -385,6 +478,7 @@ def run_suite(args):
             "mode": "deviation_study",
             "steps": steps,
             "reps": reps,
+            "seed": args.seed,
             "elapsed_sec": time.time() - start_t_study
         }
         with open(out_dir / f"meta_study_{ts}.json", "w") as f:
@@ -397,6 +491,7 @@ if __name__ == "__main__":
     parser.add_argument("--study", type=str, help="Comma-separated list of simulation steps")
     parser.add_argument("--reps", type=int, default=5, help="Repetitions per step in study mode")
     parser.add_argument("--output", type=str, default="results", help="Output directory")
+    parser.add_argument("--seed", type=int, default=None, help="Seed for the random number generator for reproducibility.")
 
     args = parser.parse_args()
     
