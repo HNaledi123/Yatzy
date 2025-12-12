@@ -7,7 +7,12 @@ import sys
 import shutil
 import concurrent.futures
 from pathlib import Path
-import numpy as np
+
+# --- DEPENDENCY CHECKS ---
+try:
+    import numpy as np
+except ImportError:
+    sys.exit("Error: Numpy is required. Please install it using 'pip install numpy'.")
 
 try:
     from numba import njit
@@ -17,19 +22,10 @@ except ImportError:
 # --- CONFIGURATION & CONSTANTS ---
 
 CATEGORY_NAMES = [
-    "Upper1", "Upper2", "Upper3", "Upper4", "Upper5", "Upper6",
-    "OfAKind2", "OfAKind3", "OfAKind4", "OfAKind5",
-    "TwoPairs", "SmallStraight", "LargeStraight", "FullHouse", "Chance"
+    "Aces", "Twos", "Threes", "Fours", "Fives", "Sixes",
+    "One Pair", "Three of a Kind", "Four of a Kind", "Yatzy",
+    "Two Pairs", "Small Straight", "Large Straight", "Full House", "Chance"
 ]
-
-CATEGORY_TRANSLATION = {
-    "Upper1": "Aces", "Upper2": "Twos", "Upper3": "Threes", 
-    "Upper4": "Fours", "Upper5": "Fives", "Upper6": "Sixes",
-    "OfAKind2": "One Pair", "OfAKind3": "Three of a Kind", "OfAKind4": "Four of a Kind", 
-    "OfAKind5": "Yatzy", "TwoPairs": "Two Pairs", 
-    "SmallStraight": "Small Straight", "LargeStraight": "Large Straight", 
-    "FullHouse": "Full House", "Chance": "Chance"
-}
 
 NUM_CATEGORIES = 15
 # Mapping strict logic indices
@@ -134,7 +130,7 @@ print("Building lookup tables...", end="", flush=True)
 TBL_SCORES, TBL_SAT, TBL_KEEP_VAL, TBL_KEEP_CNT, TBL_PRIO = _build_lookup_tables()
 print("Done.")
 
-# --- OPTIMIZED NUMBA KERNELS ---
+# --- OPTIMIZED NUMBA FUNCTIONS ---
 
 @njit(cache=True, nogil=True)
 def _encode(dice):
@@ -391,8 +387,7 @@ def run_suite(args):
             w = csv.writer(f)
             w.writerow(headers)
             for cat in CATEGORY_NAMES:
-                eng_name = CATEGORY_TRANSLATION.get(cat, cat)
-                row = [eng_name]
+                row = [cat]
                 for step in steps:
                     devs = summary_data[cat][step]
                     avg_dev = sum(devs) / len(devs) if devs else 0
