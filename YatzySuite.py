@@ -132,14 +132,14 @@ print("Done.")
 
 # --- OPTIMIZED NUMBA FUNCTIONS ---
 
-@njit(cache=True, nogil=True)
+@njit(nogil=True)
 def _encode(dice):
     k = 0
     for i in range(5): 
         k = k * 6 + (dice[i] - 1)
     return k
 
-@njit(cache=True, nogil=True)
+@njit(nogil=True)
 def _ai_reroll(dice, roll_idx, out):
     cnt = TBL_KEEP_CNT[roll_idx]
     if cnt == 5:
@@ -153,7 +153,7 @@ def _ai_reroll(dice, roll_idx, out):
     for i in range(cnt, 5): 
         out[i] = np.random.randint(1, 7)
 
-@njit(cache=True, nogil=True)
+@njit(nogil=True)
 def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
     allowed = 0x7FFF 
     total = 0
@@ -207,7 +207,7 @@ def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
     bonus = 50 if upper >= 63 else 0
     return total + bonus, bonus > 0, got_yatzy
 
-@njit(cache=True, nogil=True)
+@njit(nogil=True)
 def _worker_sim_batch(count, seed):
     np.random.seed(seed)
     scores_out = np.empty(count, dtype=np.int16)
@@ -410,15 +410,10 @@ if __name__ == "__main__":
     parser.add_argument("--study", type=str, help="Comma-separated list of simulation steps")
     parser.add_argument("--reps", type=int, default=5, help="Repetitions per step in study mode")
     parser.add_argument("--output", type=str, default="results", help="Output directory")
-    parser.add_argument("--no-cleanup", action="store_true", help="Keep __pycache__ after execution")
-    
+
     args = parser.parse_args()
     
-    try:
-        if not args.n and not args.study:
-            parser.print_help()
-        else:
-            run_suite(args)
-    finally:
-        if not args.no_cleanup:
-            _cleanup_pycache(os.path.dirname(os.path.abspath(__file__)))
+    if not args.n and not args.study:
+        parser.print_help()
+    else:
+        run_suite(args)
