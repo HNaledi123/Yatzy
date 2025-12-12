@@ -32,7 +32,7 @@ except ImportError:
     sys.exit("Error: Numpy is required. Please install it using 'pip install numpy'.")
 
 try:
-    from numba import njit
+    from numba import njit, prange
 except ImportError:
     sys.exit("Error: Numba is required. Please install it using 'pip install numba'.")
 
@@ -214,7 +214,7 @@ def _reroll(dice: np.ndarray, roll_idx: int, out: np.ndarray, rng):
     for i in range(cnt): 
         out[i] = val
     for i in range(cnt, 5): 
-        out[i] = rng.integers(1, 7)
+        out[i] = np.random.randint(1, 7)
 
 @njit(nogil=True)
 def _play_game_optimized(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndarray,
@@ -246,7 +246,7 @@ def _play_game_optimized(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndar
     
     for _ in range(NUM_CATEGORIES): 
         # Roll 1
-        d0[:] = rng.integers(1, 7, size=5, dtype=np.int8)
+        d0[:] = np.random.randint(1, 7, size=5).astype(np.int8)
         idx0 = _encode(d0)
         
         row0 = TBL_SAT[idx0]
@@ -254,14 +254,14 @@ def _play_game_optimized(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndar
             stats0[c] += row0[c]
         
         # Roll 2
-        _reroll(d0, idx0, d1, rng)
+        _reroll(d0, idx0, d1, np.random)
         idx1 = _encode(d1)
         row1 = TBL_SAT[idx1]
         for c in range(NUM_CATEGORIES): 
             stats1[c] += row1[c]
         
         # Roll 3
-        _reroll(d1, idx1, d2, rng)
+        _reroll(d1, idx1, d2, np.random)
         idx2 = _encode(d2)
         row2 = TBL_SAT[idx2]
         for c in range(NUM_CATEGORIES): 
@@ -292,9 +292,64 @@ def _play_game_optimized(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndar
         allowed &= ~(1 << best_id)
         
     bonus = UPPER_SECTION_BONUS_SCORE if upper >= UPPER_SECTION_BONUS_THRESHOLD else 0
-    return total + bonus, bonus > 0, got_yatzy
+    return np.int16(total + bonus), bonus > 0, got_yatzy
 
 @njit(nogil=True)
+def _simulation_core(count: int, rng) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    The core, Numba-optimized simulation loop.
+
+    This function is designed to be called from a Python-space wrapper that provides
+    a pre-instantiated random number generator.
+
+    Args:
+        count: The number of games to simulate.
+        rng: An initialized Numba-compatible random number generator instance.
+
+    Returns:
+        Aggregated results for the simulation batch.
+    """
+    scores_out = np.empty(count, dtype=np.int16)
+    flags_out = np.empty(count, dtype=np.int8)
+    l_s0, l_s1, l_s2 = np.zeros((3, NUM_CATEGORIES), dtype=np.int64)
+    d0, d1, d2 = np.empty((3, 5), dtype=np.int8)
+
+    for i in range(count):
+        sc, bon, ytz = _play_game_optimized(l_s0, l_s1, l_s2, d0, d1, d2, rng)
+        scores_out[i] = sc
+        flags_out[i] = (1 if bon else 0) | (2 if ytz else 0)
+    return scores_out, flags_out, l_s0, l_s1, l_s2
+
+@njit(parallel=True, nogil=True)
+def _simulation_core_parallel(count: int, seed: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    The core, Numba-optimized parallel simulation loop.
+
+    This function uses Numba's `prange` to run simulations in parallel, offering
+    higher performance than Python-level threading. It aggregates results from all threads.
+
+    Args:
+        count: The total number of games to simulate.
+        seed: A seed to initialize the thread-local random number generators.
+
+    Returns:
+        Aggregated results for the simulation batch.
+    """
+    np.random.seed(seed)
+    scores_out = np.empty(count, dtype=np.int16)
+    flags_out = np.empty(count, dtype=np.int8)
+    agg_s0, agg_s1, agg_s2 = np.zeros((3, NUM_CATEGORIES), dtype=np.int64)
+
+    for i in prange(count):
+        # Thread-local arrays for dice and stats
+        d0, d1, d2 = np.empty((3, 5), dtype=np.int8)
+        l_s0, l_s1, l_s2 = np.zeros((3, NUM_CATEGORIES), dtype=np.int64)
+        sc, bon, ytz = _play_game_optimized(l_s0, l_s1, l_s2, d0, d1, d2, np.random)
+        scores_out[i] = sc
+        flags_out[i] = (1 if bon else 0) | (2 if ytz else 0)
+        agg_s0, agg_s1, agg_s2 = agg_s0 + l_s0, agg_s1 + l_s1, agg_s2 + l_s2
+    return scores_out, flags_out, agg_s0, agg_s1, agg_s2
+
 def _worker_sim_batch(count: int, seed: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Simulates a batch of Yatzy games in a single, isolated thread.
@@ -314,30 +369,11 @@ def _worker_sim_batch(count: int, seed: int) -> Tuple[np.ndarray, np.ndarray, np
         - (np.ndarray, np.ndarray, np.ndarray): Aggregated category satisfaction counts for rolls 1, 2, and 3.
     """
     rng = np.random.default_rng(seed)
-    scores_out = np.empty(count, dtype=np.int16)
-    flags_out = np.empty(count, dtype=np.int8)
-    
-    l_s0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    l_s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    l_s2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    
-    d0 = np.empty(5, dtype=np.int8)
-    d1 = np.empty(5, dtype=np.int8)
-    d2 = np.empty(5, dtype=np.int8)
-    
-    for i in range(count):
-        sc, bon, ytz = _play_game_optimized(l_s0, l_s1, l_s2, d0, d1, d2, rng)
-        scores_out[i] = sc
-        f = 0
-        if bon: f |= 1
-        if ytz: f |= 2
-        flags_out[i] = f
-        
-    return scores_out, flags_out, l_s0, l_s1, l_s2
+    return _simulation_core(count, rng)
 
 # --- DRIVER LOGIC ---
 
-def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: np.random.Generator = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: np.random.Generator = None, use_numba_parallel: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Manages the parallel execution of the Yatzy simulation.
 
@@ -350,6 +386,7 @@ def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: 
         total_count: The total number of games to simulate.
         batch_size: The number of games to simulate per worker batch.
         main_rng: The main random number generator, used to seed the workers.
+        use_numba_parallel: If True, use Numba's `parallel=True` model.
 
     Returns:
         A tuple containing the aggregated results from all simulations:
@@ -369,37 +406,46 @@ def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: 
     all_scores = []
     all_flags = []
     
-    futures = []
     start_time = time.time()
     
-    with concurrent.futures.ThreadPoolExecutor() as executor:
+    if use_numba_parallel:
         remaining = total_count
         while remaining > 0:
             count = min(batch_size, remaining)
             seed = local_rng.integers(0, 2**30)
-            futures.append(executor.submit(_worker_sim_batch, count, seed))
-            remaining -= count
-            
-        completed = 0
-        for f in concurrent.futures.as_completed(futures):
-            res_scores, res_flags, r_s0, r_s1, r_s2 = f.result()
-            
-            agg_s0 += r_s0
-            agg_s1 += r_s1
-            agg_s2 += r_s2
-            
+            res_scores, res_flags, r_s0, r_s1, r_s2 = _simulation_core_parallel(count, seed)
+            agg_s0, agg_s1, agg_s2 = agg_s0 + r_s0, agg_s1 + r_s1, agg_s2 + r_s2
             all_scores.append(res_scores)
             all_flags.append(res_flags)
-            
-            completed += len(res_scores)
-            
+            remaining -= count
+            completed = total_count - remaining
             elapsed = time.time() - start_time
             rate = completed / elapsed if elapsed > 0 else 0
             eta = (total_count - completed) / rate if rate > 0 else 0
-            
-            # Formatted Output
             pct = completed / total_count * 100
             print(f"\rSimulating: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta:3.0f}s ", end="")
+    else: # Original ThreadPoolExecutor implementation
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = []
+            remaining = total_count
+            while remaining > 0:
+                count = min(batch_size, remaining)
+                seed = local_rng.integers(0, 2**30)
+                futures.append(executor.submit(_worker_sim_batch, count, seed))
+                remaining -= count
+            
+            completed = 0
+            for f in concurrent.futures.as_completed(futures):
+                res_scores, res_flags, r_s0, r_s1, r_s2 = f.result()
+                agg_s0, agg_s1, agg_s2 = agg_s0 + r_s0, agg_s1 + r_s1, agg_s2 + r_s2
+                all_scores.append(res_scores)
+                all_flags.append(res_flags)
+                completed += len(res_scores)
+                elapsed = time.time() - start_time
+                rate = completed / elapsed if elapsed > 0 else 0
+                eta = (total_count - completed) / rate if rate > 0 else 0
+                pct = completed / total_count * 100
+                print(f"\rSimulating: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta:3.0f}s ", end="")
             
     print() # Newline after loop
     final_scores = np.concatenate(all_scores)
