@@ -285,17 +285,6 @@ def run_simulation_parallel(total_count, batch_size=None):
     
     return final_scores, final_flags, agg_s0, agg_s1, agg_s2
 
-def _cleanup_pycache(root_directory):
-    """Recursively removes __pycache__ directories."""
-    found = False
-    for dirpath, dirnames, _ in os.walk(root_directory):
-        if "__pycache__" in dirnames:
-            pycache_path = os.path.join(dirpath, "__pycache__")
-            shutil.rmtree(pycache_path, ignore_errors=True)
-            found = True
-    if found:
-        print("Cleaned up __pycache__ and temporary files.")
-
 # --- MAIN EXECUTION ---
 
 def run_suite(args):
