@@ -360,7 +360,7 @@ def run_simulation_parallel(total_count: int, batch_size: int = None, main_rng: 
         cpu_count = os.cpu_count() or 4
         target_chunks = cpu_count * 4
         batch_size = max(1000, total_count // target_chunks)
-        batch_size = min(batch_size, 100_000)
+        batch_size = min(batch_size, 1_000_000)
 
     agg_s0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     agg_s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
