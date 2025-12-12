@@ -472,18 +472,32 @@ def run_suite(args):
     # Mode 1: Distribution Analysis
     if args.n:
         print(f"\n=== MODE 1: DISTRIBUTION ANALYSIS ({args.n:,} sim) ===")
-        start_t = time.time()        
-        scores, flags, s0, s1, s2 = run_simulation_parallel(args.n, main_rng=main_rng)
-        print("Processing data...")
+        start_t = time.time()
         
-        score_bins = np.bincount(scores, minlength=376)
-        mask_bonus = (flags & 1) > 0
-        mask_yatzy = (flags & 2) > 0
+        # Initialize bins for score distributions. Max score is 375.
+        score_bins = np.zeros(376, dtype=np.int64)
+        bins_ny_nb = np.zeros(376, dtype=np.int64)
+        bins_ny_yb = np.zeros(376, dtype=np.int64)
+        bins_yy_nb = np.zeros(376, dtype=np.int64)
+        bins_yy_yb = np.zeros(376, dtype=np.int64)
+        total_score_sum = 0
         
-        bins_ny_nb = np.bincount(scores[~mask_yatzy & ~mask_bonus], minlength=376)
-        bins_ny_yb = np.bincount(scores[~mask_yatzy & mask_bonus], minlength=376)
-        bins_yy_nb = np.bincount(scores[mask_yatzy & ~mask_bonus], minlength=376)
-        bins_yy_yb = np.bincount(scores[mask_yatzy & mask_bonus], minlength=376)
+        # This function will now be called inside the simulation loop for each completed batch
+        def process_batch(scores, flags):
+            nonlocal total_score_sum
+            total_score_sum += np.sum(scores)
+            mask_bonus = (flags & 1) > 0
+            mask_yatzy = (flags & 2) > 0
+            
+            score_bins   += np.bincount(scores, minlength=376)
+            bins_ny_nb   += np.bincount(scores[~mask_yatzy & ~mask_bonus], minlength=376)
+            bins_ny_yb   += np.bincount(scores[~mask_yatzy &  mask_bonus], minlength=376)
+            bins_yy_nb   += np.bincount(scores[ mask_yatzy & ~mask_bonus], minlength=376)
+            bins_yy_yb   += np.bincount(scores[ mask_yatzy &  mask_bonus], minlength=376)
+
+        # The simulation function now takes a callback to process results incrementally
+        s0, s1, s2 = run_simulation_parallel(args.n, main_rng=main_rng, result_callback=process_batch)
+        print("\nProcessing complete. Saving data...")
         
         with open(out_dir / f"dist_scores_{ts}.csv", "w", newline="") as f:
             w = csv.writer(f)
@@ -504,8 +518,8 @@ def run_suite(args):
             "mode": "distribution",
             "count": args.n,
             "seed": args.seed,
-            "elapsed_sec": elapsed_tot,
-            "mean_score": float(np.mean(scores)),
+            "elapsed_sec": round(elapsed_tot, 2),
+            "mean_score": float(total_score_sum / args.n),
             "performance": f"{args.n/elapsed_tot:.0f} games/sec"
         }
         with open(out_dir / f"meta_dist_{ts}.json", "w") as f:
