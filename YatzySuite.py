@@ -478,7 +478,7 @@ def run_suite(args):
         
         # This function will now be called inside the simulation loop for each completed batch
         def process_batch(scores, flags):
-            nonlocal total_score_sum
+            nonlocal total_score_sum, score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb
             total_score_sum += np.sum(scores)
             mask_bonus = (flags & 1) > 0
             mask_yatzy = (flags & 2) > 0
