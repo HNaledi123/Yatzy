@@ -10,9 +10,9 @@ The simulation employs the Monte Carlo method. Each game is played by a simple,
 deterministic AI agent. To achieve high performance suitable for millions of
 simulations, the script heavily relies on two key optimizations:
 
-1.  **Lookup Tables**: All 7,776 possible outcomes of a 5-dice roll are pre-calculated
+1.  Lookup Tables: All 7,776 possible outcomes of a 5-dice roll are pre-calculated
     at startup. This includes scores for every category and a basic re-roll strategy.
-2.  **Numba JIT Compilation**: The core game-playing logic is Just-In-Time compiled
+2.  Numba JIT Compilation: The core game-playing logic is Just-In-Time compiled
     using Numba, which translates Python code into highly efficient machine code.
 """
 import argparse
