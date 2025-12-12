@@ -4,7 +4,6 @@ import json
 import os
 import time
 import sys
-import shutil
 import concurrent.futures
 from pathlib import Path
 
@@ -34,22 +33,21 @@ YATZY_IDX = 9
 ROLL_STATE_COUNT = 6 ** 5
 
 # Exact probabilities based on 7776 outcomes (6^5)
-_D = 7776.0
 EXPECTED_PROBS = np.array([
-    4651 / _D,  # Aces
-    4651 / _D,  # Twos
-    4651 / _D,  # Threes
-    4651 / _D,  # Fours
-    4651 / _D,  # Fives
-    4651 / _D,  # Sixes
-    7056 / _D,  # One Pair
-    1656 / _D,  # Three of a Kind
-    156  / _D,  # Four of a Kind
-    6    / _D,  # Yatzy
-    2100 / _D,  # Two Pairs
-    120  / _D,  # Small Straight
-    120  / _D,  # Large Straight
-    300  / _D,  # Full House
+    4651 / ROLL_STATE_COUNT,  # Aces
+    4651 / ROLL_STATE_COUNT,  # Twos
+    4651 / ROLL_STATE_COUNT,  # Threes
+    4651 / ROLL_STATE_COUNT,  # Fours
+    4651 / ROLL_STATE_COUNT,  # Fives
+    4651 / ROLL_STATE_COUNT,  # Sixes
+    7056 / ROLL_STATE_COUNT,  # One Pair
+    1656 / ROLL_STATE_COUNT,  # Three of a Kind
+    156  / ROLL_STATE_COUNT,  # Four of a Kind
+    6    / ROLL_STATE_COUNT,  # Yatzy
+    2100 / ROLL_STATE_COUNT,  # Two Pairs
+    120  / ROLL_STATE_COUNT,  # Small Straight
+    120  / ROLL_STATE_COUNT,  # Large Straight
+    300  / ROLL_STATE_COUNT,  # Full House
     1.0         # Chance
 ])
 
