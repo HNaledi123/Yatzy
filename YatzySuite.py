@@ -398,7 +398,7 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) 
                     aggregate_stats_roll1 += s0
                     aggregate_stats_roll2 += s1
                     aggregate_stats_roll3 += s2
-                    sims_completed += sum(score_bins)
+                    sims_completed += int(sum(score_bins))
                 except Exception as e:
                     print("\n\n--- A CRITICAL ERROR OCCURRED ---")
                     print(f"Simulation halted due to an exception in a worker thread: {e}")
