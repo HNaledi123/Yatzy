@@ -35,7 +35,6 @@ SCORE_BINS_SIZE = MAX_SCORE + 1
 # Mapping strict logic indices
 OF_A_KIND_TO_IDX = {2: 6, 3: 7, 4: 8, 5: 9}
 YATZY_IDX = 9
-ROLL_STATE_COUNT = 6 ** 5
 
 # Exact probabilities based on 7776 outcomes (6^5)
 EXPECTED_PROBS = np.array([
@@ -139,6 +138,7 @@ def _build_lookup_tables():
             
         # Full House
         if np.any(counts == 3) and np.any(counts == 2):
+            # Score is the sum of all dice, which is correct for a Full House.
             scores[idx, 13] = (np.where(counts==3)[0][0]*3 + np.where(counts==2)[0][0]*2)
             sat_mask[idx, 13] = 1
 
@@ -146,7 +146,7 @@ def _build_lookup_tables():
         scores[idx, 14] = d_sum
         sat_mask[idx, 14] = 1
 
-        # Pre-calc keep strategy (keep max counts)
+        # Pre-calc keep strategy: find the face value with the highest count.
         c_no_zero = counts[1:]
         mx = c_no_zero.max()
         kv = 1
@@ -471,7 +471,7 @@ def run_suite(args):
         for i_step, step in enumerate(steps):
             for r in range(reps):
                 # Hide the inner progress bar and show a static message
-                print(f"\nRunning Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...")
+                print(f"\rRunning Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...          ", end="")
                 _, _, _, _, _, _, stats_roll1, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)))
                 
                 games_completed += step
@@ -495,7 +495,7 @@ def run_suite(args):
                 rate = games_completed / elapsed if elapsed > 0 else 0
                 eta = (total_games_in_study - games_completed) / rate if rate > 0 else 0
                 pct = games_completed / total_games_in_study * 100
-                print(f"Overall Study Progress: {pct:5.1f}% | {games_completed:,}/{total_games_in_study:,} games | ETA: {eta:.0f}s")
+                print(f"\nOverall Study Progress: {pct:5.1f}% | {games_completed:,}/{total_games_in_study:,} games | ETA: {eta:.0f}s")
 
         print("\nStudy simulations complete. Saving data...")
         with open(out_dir / f"study_deviation_{ts}.csv", "w", newline="") as f:
