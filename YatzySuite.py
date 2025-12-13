@@ -441,13 +441,18 @@ def run_suite(args):
         print(f"\n=== MODE 2: DEVIATION STUDY ({len(steps)} steps, {reps} reps/step) ===")
         results = []
         summary_data = {cat: {step: [] for step in steps} for cat in CATEGORY_NAMES}
+        
+        total_games_in_study = sum(steps) * reps
+        games_completed = 0
         start_t_study = time.time()
         
-        for step in steps:
+        for i_step, step in enumerate(steps):
             for r in range(reps):
-                print(f"\rRunning simulation: Step {step}, Rep {r+1}/{reps}...", end="")
+                # Hide the inner progress bar and show a static message
+                print(f"\nRunning Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...")
                 _, _, _, _, _, _, s0, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)))
                 
+                games_completed += step
                 total_rolls = step * NUM_CATEGORIES
                 obs_probs = s0 / total_rolls
                 abs_devs = np.abs(obs_probs - EXPECTED_PROBS) * 100 
@@ -463,8 +468,14 @@ def run_suite(args):
                         "Abs_Deviation_Pct": dev_val
                     })
                     summary_data[cat][step].append(dev_val)
+                
+                elapsed = time.time() - start_t_study
+                rate = games_completed / elapsed if elapsed > 0 else 0
+                eta = (total_games_in_study - games_completed) / rate if rate > 0 else 0
+                pct = games_completed / total_games_in_study * 100
+                print(f"Overall Study Progress: {pct:5.1f}% | {games_completed:,}/{total_games_in_study:,} games | ETA: {eta:.0f}s")
 
-        print("\nAnalysis complete. Saving data...")
+        print("\nStudy simulations complete. Saving data...")
         with open(out_dir / f"study_deviation_{ts}.csv", "w", newline="") as f:
             fields = ["Simulations", "Repetition", "Category", "Expected_Pct", "Observed_Pct", "Abs_Deviation_Pct"]
             w = csv.DictWriter(f, fieldnames=fields)
@@ -480,7 +491,7 @@ def run_suite(args):
                 for step in steps:
                     devs = summary_data[cat][step]
                     avg_dev = sum(devs) / len(devs) if devs else 0
-                    row.append(f"{avg_dev:.4f}")
+                    row.append(f"{avg_dev:.4g}")
                 w.writerow(row)
 
         meta_study = {
