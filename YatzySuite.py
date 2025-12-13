@@ -5,6 +5,7 @@ import os
 import time
 import sys
 import concurrent.futures
+from typing import Tuple, Optional
 from pathlib import Path
 
 # --- DEPENDENCY CHECKS ---
@@ -57,7 +58,7 @@ EXPECTED_PROBS = np.array([
 
 # --- LOOKUP TABLE GENERATION ---
 
-def _build_lookup_tables():
+def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Generates lookup tables for all possible 7776 dice roll outcomes (6^5).
 
@@ -166,7 +167,7 @@ print("Done.")
 # --- OPTIMIZED NUMBA FUNCTIONS ---
 
 @njit(nogil=True)
-def _encode(dice):
+def _encode(dice: np.ndarray) -> int:
     """
     Encodes a 5-dice roll into a unique integer index from 0 to 7775.
 
@@ -186,7 +187,7 @@ def _encode(dice):
     return k
 
 @njit(nogil=True)
-def _ai_reroll(dice, roll_idx, out):
+def _ai_reroll(dice: np.ndarray, roll_idx: int, out: np.ndarray) -> None:
     """
     Determines which dice to re-roll based on a simple AI strategy.
     The strategy is to keep the dice that appear most frequently.
@@ -205,7 +206,7 @@ def _ai_reroll(dice, roll_idx, out):
         out[i] = np.random.randint(1, 7)
 
 @njit(nogil=True)
-def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
+def _play_game_optimized(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndarray, d0: np.ndarray, d1: np.ndarray, d2: np.ndarray) -> Tuple[int, bool, bool]:
     """
     Simulates a single, complete game of Yatzy using an optimized, Numba-jitted function.
 
@@ -279,7 +280,7 @@ def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
     return total + bonus, bonus > 0, got_yatzy
 
 @njit(nogil=True)
-def _worker_sim_batch(count, seed):
+def _worker_sim_batch(count: int, seed: int) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Worker function to simulate a batch of Yatzy games and return aggregated results.
 
@@ -328,7 +329,7 @@ def _worker_sim_batch(count, seed):
 
 # --- DRIVER LOGIC ---
 
-def run_simulation_parallel(total_count, batch_size=None):
+def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Runs Yatzy simulations in parallel using a streaming, constant-memory approach.
 
@@ -409,7 +410,7 @@ def run_simulation_parallel(total_count, batch_size=None):
 
 # --- MAIN EXECUTION ---
 
-def run_suite(args):
+def run_suite(args: argparse.Namespace) -> None:
     """
     Main entry point to run the simulation suite based on command-line arguments.
 
