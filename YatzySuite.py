@@ -296,7 +296,7 @@ def _worker_sim_batch(count, seed):
 
 # --- DRIVER LOGIC ---
 
-def run_simulation_parallel(total_count, batch_size=None):
+def run_simulation_parallel(total_count, batch_size=None, process_in_stream=False):
     """
     Runs Yatzy simulations in parallel using a thread pool.
 
@@ -307,7 +307,10 @@ def run_simulation_parallel(total_count, batch_size=None):
     Args:
         total_count (int): The total number of games to simulate.
         batch_size (int, optional): The number of games per worker batch.
-                                    If None, a suitable size is calculated.
+                                    If None, a suitable size is calculated. If None, a suitable size is calculated.
+        process_in_stream (bool): If True, process results in a streaming fashion
+                                  to conserve memory, returning aggregated data
+                                  instead of all individual scores.
 
     Returns:
         tuple: Final aggregated results from all workers.
@@ -322,8 +325,15 @@ def run_simulation_parallel(total_count, batch_size=None):
     agg_s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     agg_s2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     
-    all_scores = []
-    all_flags = []
+    # Pre-allocate bins for streaming processing to save memory
+    if process_in_stream:
+        score_bins = np.zeros(376, dtype=np.int64)
+        bins_ny_nb = np.zeros(376, dtype=np.int64)
+        bins_ny_yb = np.zeros(376, dtype=np.int64)
+        bins_yy_nb = np.zeros(376, dtype=np.int64)
+        bins_yy_yb = np.zeros(376, dtype=np.int64)
+    else:
+        all_scores, all_flags = [], []
     
     futures = []
     start_time = time.time()
@@ -344,8 +354,18 @@ def run_simulation_parallel(total_count, batch_size=None):
             agg_s1 += r_s1
             agg_s2 += r_s2
             
-            all_scores.append(res_scores)
-            all_flags.append(res_flags)
+            if process_in_stream:
+                # Aggregate results immediately and discard raw data
+                mask_bonus = (res_flags & 1) > 0
+                mask_yatzy = (res_flags & 2) > 0
+                score_bins += np.bincount(res_scores, minlength=376)
+                bins_ny_nb += np.bincount(res_scores[~mask_yatzy & ~mask_bonus], minlength=376)
+                bins_ny_yb += np.bincount(res_scores[~mask_yatzy & mask_bonus], minlength=376)
+                bins_yy_nb += np.bincount(res_scores[mask_yatzy & ~mask_bonus], minlength=376)
+                bins_yy_yb += np.bincount(res_scores[mask_yatzy & mask_bonus], minlength=376)
+            else:
+                all_scores.append(res_scores)
+                all_flags.append(res_flags)
             
             completed += len(res_scores)
             
@@ -358,10 +378,13 @@ def run_simulation_parallel(total_count, batch_size=None):
             print(f"\rSimulating: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta:3.0f}s ", end="")
             
     print() # Newline after loop
-    final_scores = np.concatenate(all_scores)
-    final_flags = np.concatenate(all_flags)
-    
-    return final_scores, final_flags, agg_s0, agg_s1, agg_s2
+    if process_in_stream:
+        # For study mode, we only need the roll1 stats
+        return (score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb), None, agg_s0, agg_s1, agg_s2
+    else:
+        final_scores = np.concatenate(all_scores)
+        final_flags = np.concatenate(all_flags)
+        return final_scores, final_flags, agg_s0, agg_s1, agg_s2
 
 # --- MAIN EXECUTION ---
 
@@ -383,17 +406,24 @@ def run_suite(args):
     if args.n:
         print(f"\n=== MODE 1: DISTRIBUTION ANALYSIS ({args.n:,} sim) ===")
         start_t = time.time()
-        scores, flags, s0, s1, s2 = run_simulation_parallel(args.n)
+        # Use streaming for large N to conserve memory
+        use_streaming = args.n > 10_000_000
+        results, flags, s0, s1, s2 = run_simulation_parallel(args.n, process_in_stream=use_streaming)
         print("Processing data...")
         
-        score_bins = np.bincount(scores, minlength=376)
-        mask_bonus = (flags & 1) > 0
-        mask_yatzy = (flags & 2) > 0
-        
-        bins_ny_nb = np.bincount(scores[~mask_yatzy & ~mask_bonus], minlength=376)
-        bins_ny_yb = np.bincount(scores[~mask_yatzy & mask_bonus], minlength=376)
-        bins_yy_nb = np.bincount(scores[mask_yatzy & ~mask_bonus], minlength=376)
-        bins_yy_yb = np.bincount(scores[mask_yatzy & mask_bonus], minlength=376)
+        if use_streaming:
+            score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb = results
+            mean_score = sum(s * c for s, c in enumerate(score_bins)) / score_bins.sum()
+        else: # Original behavior for smaller N
+            scores = results
+            score_bins = np.bincount(scores, minlength=376)
+            mask_bonus = (flags & 1) > 0
+            mask_yatzy = (flags & 2) > 0
+            bins_ny_nb = np.bincount(scores[~mask_yatzy & ~mask_bonus], minlength=376)
+            bins_ny_yb = np.bincount(scores[~mask_yatzy & mask_bonus], minlength=376)
+            bins_yy_nb = np.bincount(scores[mask_yatzy & ~mask_bonus], minlength=376)
+            bins_yy_yb = np.bincount(scores[mask_yatzy & mask_bonus], minlength=376)
+            mean_score = float(np.mean(scores))
         
         with open(out_dir / f"dist_scores_{ts}.csv", "w", newline="") as f:
             w = csv.writer(f)
@@ -414,7 +444,7 @@ def run_suite(args):
             "mode": "distribution",
             "count": args.n,
             "elapsed_sec": elapsed_tot,
-            "mean_score": float(np.mean(scores)),
+            "mean_score": mean_score,
             "performance": f"{args.n/elapsed_tot:.0f} games/sec"
         }
         with open(out_dir / f"meta_dist_{ts}.json", "w") as f:
@@ -433,7 +463,7 @@ def run_suite(args):
         for step in steps:
             for r in range(reps):
                 print(f"\rRunning simulation: Step {step}, Rep {r+1}/{reps}...", end="")
-                _, _, s0, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)))
+                _, _, s0, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)), process_in_stream=True)
                 
                 total_rolls = step * NUM_CATEGORIES
                 obs_probs = s0 / total_rolls
