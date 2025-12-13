@@ -75,7 +75,6 @@ def _build_lookup_tables():
     keep_cnt = np.zeros(ROLL_STATE_COUNT, dtype=np.int8)
     
     # Priority for AI decision making
-    priority = np.array([5, 4, 3, 2, 1, 0, 9, 8, 7, 6, 10, 12, 11, 13, 14], dtype=np.int8)
     priority = np.array([5, 4, 3, 2, 1, 0, 9, 8, 7, 6, 10, 12, 11, 13, 14], dtype=np.int8) # Order to check categories
 
     for idx, dice in enumerate(product(range(1, 7), repeat=5)):
@@ -185,7 +184,6 @@ def _ai_reroll(dice, roll_idx, out):
 
 @njit(nogil=True)
 def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
-    allowed = 0x7FFF 
     """
     Simulates a single, complete game of Yatzy using an optimized, Numba-jitted function.
 
@@ -241,7 +239,6 @@ def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
         
         for i in range(NUM_CATEGORIES):
             cat = TBL_PRIO[i]
-            if (allowed >> cat) & 1:
             if (allowed_categories >> cat) & 1:
                 s = scores[cat]
                 if s > best_sc:
@@ -254,7 +251,6 @@ def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
         if best_id == YATZY_IDX and best_sc > 0: 
             got_yatzy = True
         
-        allowed &= ~(1 << best_id)
         allowed_categories &= ~(1 << best_id)
         
     bonus = 50 if upper >= 63 else 0
