@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import traceback
 import os
 import time
 import sys
@@ -18,6 +19,9 @@ try:
     from numba import njit
 except ImportError:
     sys.exit("Error: Numba is required. Please install it using 'pip install numba'.")
+
+# Promote numpy warnings (like overflow) to exceptions to halt execution
+np.seterr(all='raise')
 
 # --- CONFIGURATION & CONSTANTS ---
 
@@ -352,23 +356,23 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) 
         batch_size = min(batch_size, 100_000)
 
     # Global aggregates
-    agg_total_score = 0
-    agg_score_bins = np.zeros(SCORE_BINS_SIZE, dtype=np.int64)
-    agg_bins_ny_nb = np.zeros(SCORE_BINS_SIZE, dtype=np.int64)
-    agg_bins_ny_yb = np.zeros(SCORE_BINS_SIZE, dtype=np.int64)
-    agg_bins_yy_nb = np.zeros(SCORE_BINS_SIZE, dtype=np.int64)
-    agg_bins_yy_yb = np.zeros(SCORE_BINS_SIZE, dtype=np.int64)
-    aggregate_stats_roll1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    aggregate_stats_roll2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    aggregate_stats_roll3 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    agg_total_score = 0 # Use Python int for arbitrary precision
+    agg_score_bins = np.zeros(SCORE_BINS_SIZE, dtype=object)
+    agg_bins_ny_nb = np.zeros(SCORE_BINS_SIZE, dtype=object)
+    agg_bins_ny_yb = np.zeros(SCORE_BINS_SIZE, dtype=object)
+    agg_bins_yy_nb = np.zeros(SCORE_BINS_SIZE, dtype=object)
+    agg_bins_yy_yb = np.zeros(SCORE_BINS_SIZE, dtype=object)
+    aggregate_stats_roll1 = np.zeros(NUM_CATEGORIES, dtype=object)
+    aggregate_stats_roll2 = np.zeros(NUM_CATEGORIES, dtype=object)
+    aggregate_stats_roll3 = np.zeros(NUM_CATEGORIES, dtype=object)
 
     start_time = time.time()
     max_in_flight = cpu_count * 2
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_count) as executor:
         futures = set()
-        sims_submitted = 0
-        sims_completed = 0
+        sims_submitted = 0 # Use Python int
+        sims_completed = 0 # Use Python int
 
         while sims_completed < total_count:
             # Submit new tasks only if there is capacity
@@ -396,8 +400,12 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) 
                     aggregate_stats_roll3 += s2
                     sims_completed += sum(score_bins)
                 except Exception as e:
-                    print(f"\nError in worker: {e}")
-                    raise
+                    print("\n\n--- A CRITICAL ERROR OCCURRED ---")
+                    print(f"Simulation halted due to an exception in a worker thread: {e}")
+                    traceback.print_exc()
+                    print("--- END OF ERROR REPORT ---")
+                    # We must re-raise to stop the program
+                    raise e
 
             elapsed = time.time() - start_time
             rate = sims_completed / elapsed if elapsed > 0 else 0
