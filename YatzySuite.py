@@ -27,6 +27,11 @@ CATEGORY_NAMES = [
 ]
 
 NUM_CATEGORIES = 15
+DICE_COUNT = 5
+DICE_FACES = 6
+ROLL_STATE_COUNT = DICE_FACES ** DICE_COUNT
+MAX_SCORE = 374 # Theoretical maximum score in Yatzy
+SCORE_BINS_SIZE = MAX_SCORE + 1
 # Mapping strict logic indices
 OF_A_KIND_TO_IDX = {2: 6, 3: 7, 4: 8, 5: 9}
 YATZY_IDX = 9
@@ -73,11 +78,27 @@ def _build_lookup_tables():
     sat_mask = np.zeros((ROLL_STATE_COUNT, NUM_CATEGORIES), dtype=np.uint8)
     keep_val = np.zeros(ROLL_STATE_COUNT, dtype=np.int8)
     keep_cnt = np.zeros(ROLL_STATE_COUNT, dtype=np.int8)
-    
-    # Priority for AI decision making
-    priority = np.array([5, 4, 3, 2, 1, 0, 9, 8, 7, 6, 10, 12, 11, 13, 14], dtype=np.int8) # Order to check categories
 
-    for idx, dice in enumerate(product(range(1, 7), repeat=5)):
+    # This array defines the order in which the AI checks for available categories to score
+    priority = np.array([
+        5,  # Sixes
+        4,  # Fives
+        3,  # Fours
+        2,  # Threes
+        1,  # Twos
+        0,  # Aces
+        9,  # Yatzy
+        8,  # Four of a Kind
+        7,  # Three of a Kind
+        6,  # One Pair
+        10, # Two Pairs
+        12, # Large Straight
+        11, # Small Straight
+        13, # Full House
+        14  # Chance (fallback)
+    ], dtype=np.int8)
+
+    for idx, dice in enumerate(product(range(1, DICE_FACES + 1), repeat=DICE_COUNT)):
         d_arr = np.array(dice, dtype=np.int8)
         counts = np.bincount(d_arr, minlength=7)
         s_dice = np.sort(d_arr)
@@ -151,6 +172,7 @@ def _encode(dice):
 
     This treats the dice roll as a base-6 number, allowing it to be used
     as an index into the pre-calculated lookup tables.
+    e.g., (d1-1)*6^4 + (d2-1)*6^3 + ... + (d5-1)*6^0
 
     Args:
         dice (np.ndarray): A numpy array of 5 integers (1-6) representing the dice.
@@ -159,7 +181,7 @@ def _encode(dice):
         int: The unique integer index for the roll.
     """
     k = 0
-    for i in range(5): 
+    for i in range(DICE_COUNT): 
         k = k * 6 + (dice[i] - 1)
     return k
 
@@ -172,14 +194,14 @@ def _ai_reroll(dice, roll_idx, out):
     """
     cnt = TBL_KEEP_CNT[roll_idx]
     if cnt == 5:
-        for i in range(5):
+        for i in range(DICE_COUNT):
             out[i] = dice[i]
         return
         
     val = TBL_KEEP_VAL[roll_idx]
     for i in range(cnt): 
         out[i] = val
-    for i in range(cnt, 5): 
+    for i in range(cnt, DICE_COUNT): 
         out[i] = np.random.randint(1, 7)
 
 @njit(nogil=True)
@@ -211,7 +233,7 @@ def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
     # A game consists of 15 rounds, one for each category
     for _ in range(NUM_CATEGORIES): 
         # Roll 1
-        for i in range(5): 
+        for i in range(DICE_COUNT): 
             d0[i] = np.random.randint(1, 7)
         idx0 = _encode(d0)
         
@@ -276,33 +298,33 @@ def _worker_sim_batch(count, seed):
     np.random.seed(seed)
     # Local aggregates
     total_score = 0
-    score_bins = np.zeros(376, dtype=np.uint32)
-    bins_ny_nb = np.zeros(376, dtype=np.uint32)
-    bins_ny_yb = np.zeros(376, dtype=np.uint32)
-    bins_yy_nb = np.zeros(376, dtype=np.uint32)
-    bins_yy_yb = np.zeros(376, dtype=np.uint32)
-    l_s0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    l_s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    l_s2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    score_bins = np.zeros(SCORE_BINS_SIZE, dtype=np.uint32)
+    bins_ny_nb = np.zeros(SCORE_BINS_SIZE, dtype=np.uint32)
+    bins_ny_yb = np.zeros(SCORE_BINS_SIZE, dtype=np.uint32)
+    bins_yy_nb = np.zeros(SCORE_BINS_SIZE, dtype=np.uint32)
+    bins_yy_yb = np.zeros(SCORE_BINS_SIZE, dtype=np.uint32)
+    local_stats_roll1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    local_stats_roll2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    local_stats_roll3 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
 
-    d0 = np.empty(5, dtype=np.int8)
-    d1 = np.empty(5, dtype=np.int8)
-    d2 = np.empty(5, dtype=np.int8)
+    d0 = np.empty(DICE_COUNT, dtype=np.int8)
+    d1 = np.empty(DICE_COUNT, dtype=np.int8)
+    d2 = np.empty(DICE_COUNT, dtype=np.int8)
 
     for i in range(count):
-        sc, bon, ytz = _play_game_optimized(l_s0, l_s1, l_s2, d0, d1, d2)
-        total_score += sc
-        score_bins[sc] += 1
-        if not ytz and not bon:
-            bins_ny_nb[sc] += 1
-        elif not ytz and bon:
-            bins_ny_yb[sc] += 1
-        elif ytz and not bon:
-            bins_yy_nb[sc] += 1
-        else:  # ytz and bon
-            bins_yy_yb[sc] += 1
+        score, has_bonus, has_yatzy = _play_game_optimized(local_stats_roll1, local_stats_roll2, local_stats_roll3, d0, d1, d2)
+        total_score += score
+        score_bins[score] += 1
+        if not has_yatzy and not has_bonus:
+            bins_ny_nb[score] += 1
+        elif not has_yatzy and has_bonus:
+            bins_ny_yb[score] += 1
+        elif has_yatzy and not has_bonus:
+            bins_yy_nb[score] += 1
+        else:  # has_yatzy and has_bonus
+            bins_yy_yb[score] += 1
 
-    return total_score, score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb, l_s0, l_s1, l_s2
+    return total_score, score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb, local_stats_roll1, local_stats_roll2, local_stats_roll3
 
 # --- DRIVER LOGIC ---
 
@@ -330,14 +352,14 @@ def run_simulation_parallel(total_count, batch_size=None):
 
     # Global aggregates
     agg_total_score = 0
-    agg_score_bins = np.zeros(376, dtype=np.int64)
-    agg_bins_ny_nb = np.zeros(376, dtype=np.int64)
-    agg_bins_ny_yb = np.zeros(376, dtype=np.int64)
-    agg_bins_yy_nb = np.zeros(376, dtype=np.int64)
-    agg_bins_yy_yb = np.zeros(376, dtype=np.int64)
-    agg_s0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    agg_s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    agg_s2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    agg_score_bins = np.zeros(SCORE_BINS_SIZE, dtype=np.int64)
+    agg_bins_ny_nb = np.zeros(SCORE_BINS_SIZE, dtype=np.int64)
+    agg_bins_ny_yb = np.zeros(SCORE_BINS_SIZE, dtype=np.int64)
+    agg_bins_yy_nb = np.zeros(SCORE_BINS_SIZE, dtype=np.int64)
+    agg_bins_yy_yb = np.zeros(SCORE_BINS_SIZE, dtype=np.int64)
+    aggregate_stats_roll1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    aggregate_stats_roll2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
+    aggregate_stats_roll3 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
 
     start_time = time.time()
     max_in_flight = cpu_count * 2
@@ -361,20 +383,20 @@ def run_simulation_parallel(total_count, batch_size=None):
             for f in done:
                 try:
                     # Retrieve and aggregate results immediately
-                    (total_sc, sc_bins, ny_nb, ny_yb, yy_nb, yy_yb, s0, s1, s2) = f.result()
-                    agg_total_score += total_sc
-                    agg_score_bins += sc_bins
+                    (total_score, score_bins, ny_nb, ny_yb, yy_nb, yy_yb, s0, s1, s2) = f.result()
+                    agg_total_score += total_score
+                    agg_score_bins += score_bins
                     agg_bins_ny_nb += ny_nb
                     agg_bins_ny_yb += ny_yb
                     agg_bins_yy_nb += yy_nb
                     agg_bins_yy_yb += yy_yb
-                    agg_s0 += s0
-                    agg_s1 += s1
-                    agg_s2 += s2
-                    sims_completed += sum(sc_bins)
+                    aggregate_stats_roll1 += s0
+                    aggregate_stats_roll2 += s1
+                    aggregate_stats_roll3 += s2
+                    sims_completed += sum(score_bins)
                 except Exception as e:
                     print(f"\nError in worker: {e}")
-                    # Optionally, re-raise or handle the error
+                    raise
 
             elapsed = time.time() - start_time
             rate = sims_completed / elapsed if elapsed > 0 else 0
@@ -383,7 +405,7 @@ def run_simulation_parallel(total_count, batch_size=None):
             print(f"\rSimulating: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta:3.0f}s ", end="")
 
     print() # Newline after loop
-    return agg_total_score, agg_score_bins, agg_bins_ny_nb, agg_bins_ny_yb, agg_bins_yy_nb, agg_bins_yy_yb, agg_s0, agg_s1, agg_s2
+    return agg_total_score, agg_score_bins, agg_bins_ny_nb, agg_bins_ny_yb, agg_bins_yy_nb, agg_bins_yy_yb, aggregate_stats_roll1, aggregate_stats_roll2, aggregate_stats_roll3
 
 # --- MAIN EXECUTION ---
 
@@ -405,13 +427,13 @@ def run_suite(args):
     if args.n:
         print(f"\n=== MODE 1: DISTRIBUTION ANALYSIS ({args.n:,} sim) ===")
         start_t = time.time()
-        total_score, score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb, s0, s1, s2 = run_simulation_parallel(args.n)
+        total_score, score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb, stats_roll1, stats_roll2, stats_roll3 = run_simulation_parallel(args.n)
         print("Processing data...")
 
         with open(out_dir / f"dist_scores_{ts}.csv", "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["Score", "Count_Total", "NoYatzy_NoBonus", "NoYatzy_YesBonus", "YesYatzy_NoBonus", "YesYatzy_YesBonus"])
-            for s in range(376):
+            for s in range(SCORE_BINS_SIZE):
                 if score_bins[s] > 0:
                     w.writerow([s, int(score_bins[s]), int(bins_ny_nb[s]), int(bins_ny_yb[s]), int(bins_yy_nb[s]), int(bins_yy_yb[s])])
 
@@ -420,7 +442,7 @@ def run_suite(args):
             w = csv.writer(f)
             w.writerow(["Category", "Roll1_Hits", "Roll1_Prob", "Roll2_Hits", "Roll2_Prob", "Roll3_Hits", "Roll3_Prob"])
             for i, cat in enumerate(CATEGORY_NAMES):
-                w.writerow([cat, s0[i], s0[i]/tot_r, s1[i], s1[i]/tot_r, s2[i], s2[i]/tot_r])
+                w.writerow([cat, stats_roll1[i], stats_roll1[i]/tot_r, stats_roll2[i], stats_roll2[i]/tot_r, stats_roll3[i], stats_roll3[i]/tot_r])
                 
         elapsed_tot = time.time() - start_t
         meta = {
@@ -450,11 +472,11 @@ def run_suite(args):
             for r in range(reps):
                 # Hide the inner progress bar and show a static message
                 print(f"\nRunning Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...")
-                _, _, _, _, _, _, s0, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)))
+                _, _, _, _, _, _, stats_roll1, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)))
                 
                 games_completed += step
                 total_rolls = step * NUM_CATEGORIES
-                obs_probs = s0 / total_rolls
+                obs_probs = stats_roll1 / total_rolls
                 abs_devs = np.abs(obs_probs - EXPECTED_PROBS) * 100 
                 
                 for i, cat in enumerate(CATEGORY_NAMES):
