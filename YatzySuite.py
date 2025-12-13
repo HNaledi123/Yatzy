@@ -401,7 +401,7 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) 
 
             elapsed = time.time() - start_time
             rate = sims_completed / elapsed if elapsed > 0 else 0
-            eta = (total_count - sims_completed) / rate if rate > 0 else 0
+            eta = (float(total_count) - sims_completed) / rate if rate > 0 else 0
             pct = sims_completed / total_count * 100
             print(f"\rSimulating: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta:3.0f}s ", end="")
 
