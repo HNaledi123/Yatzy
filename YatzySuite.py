@@ -259,50 +259,60 @@ def _play_game_optimized(stats0, stats1, stats2, d0, d1, d2):
 @njit(nogil=True)
 def _worker_sim_batch(count, seed):
     """
-    Worker function to simulate a batch of Yatzy games.
+    Worker function to simulate a batch of Yatzy games and return aggregated results.
 
     This function is designed to be run in a separate thread. It initializes
     its own random seed and runs a specified number of games, aggregating
-    the results and statistics.
+    the results and statistics locally to ensure constant memory usage.
 
     Args:
         count (int): The number of games to simulate in this batch.
         seed (int): The random seed to initialize for this worker.
 
     Returns:
-        tuple: Aggregated results: (scores, flags, stats_roll1, stats_roll2, stats_roll3).
+        tuple: Aggregated results: (total_score, score_bins, bins_ny_nb,
+               bins_ny_yb, bins_yy_nb, bins_yy_yb, stats_roll1, stats_roll2, stats_roll3).
     """
     np.random.seed(seed)
-    scores_out = np.empty(count, dtype=np.int16)
-    flags_out = np.empty(count, dtype=np.int8)
-    
+    # Local aggregates
+    total_score = 0
+    score_bins = np.zeros(376, dtype=np.uint32)
+    bins_ny_nb = np.zeros(376, dtype=np.uint32)
+    bins_ny_yb = np.zeros(376, dtype=np.uint32)
+    bins_yy_nb = np.zeros(376, dtype=np.uint32)
+    bins_yy_yb = np.zeros(376, dtype=np.uint32)
     l_s0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     l_s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     l_s2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    
+
     d0 = np.empty(5, dtype=np.int8)
     d1 = np.empty(5, dtype=np.int8)
     d2 = np.empty(5, dtype=np.int8)
-    
+
     for i in range(count):
         sc, bon, ytz = _play_game_optimized(l_s0, l_s1, l_s2, d0, d1, d2)
-        scores_out[i] = sc
-        f = 0
-        if bon: f |= 1
-        if ytz: f |= 2
-        flags_out[i] = f
-        
-    return scores_out, flags_out, l_s0, l_s1, l_s2
+        total_score += sc
+        score_bins[sc] += 1
+        if not ytz and not bon:
+            bins_ny_nb[sc] += 1
+        elif not ytz and bon:
+            bins_ny_yb[sc] += 1
+        elif ytz and not bon:
+            bins_yy_nb[sc] += 1
+        else:  # ytz and bon
+            bins_yy_yb[sc] += 1
+
+    return total_score, score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb, l_s0, l_s1, l_s2
 
 # --- DRIVER LOGIC ---
 
 def run_simulation_parallel(total_count, batch_size=None):
     """
-    Runs Yatzy simulations in parallel using a thread pool.
+    Runs Yatzy simulations in parallel using a streaming, constant-memory approach.
 
-    It divides the total number of simulations into smaller batches and
-    distributes them among worker threads for concurrent execution.
-    It also displays a progress bar.
+    This function uses a thread pool with a bounded number of in-flight tasks.
+    Workers aggregate results locally, and the main thread merges these aggregates
+    as they complete, ensuring that memory usage does not scale with `total_count`.
 
     Args:
         total_count (int): The total number of games to simulate.
@@ -311,57 +321,69 @@ def run_simulation_parallel(total_count, batch_size=None):
 
     Returns:
         tuple: Final aggregated results from all workers.
-    """
+    """    
+    cpu_count = os.cpu_count() or 4
     if batch_size is None:
-        cpu_count = os.cpu_count() or 4
         target_chunks = cpu_count * 4
         batch_size = max(1000, total_count // target_chunks)
         batch_size = min(batch_size, 100_000)
 
+    # Global aggregates
+    agg_total_score = 0
+    agg_score_bins = np.zeros(376, dtype=np.int64)
+    agg_bins_ny_nb = np.zeros(376, dtype=np.int64)
+    agg_bins_ny_yb = np.zeros(376, dtype=np.int64)
+    agg_bins_yy_nb = np.zeros(376, dtype=np.int64)
+    agg_bins_yy_yb = np.zeros(376, dtype=np.int64)
     agg_s0 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     agg_s1 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
     agg_s2 = np.zeros(NUM_CATEGORIES, dtype=np.int64)
-    
-    all_scores = []
-    all_flags = []
-    
-    futures = []
+
     start_time = time.time()
-    
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        remaining = total_count
-        while remaining > 0:
-            count = min(batch_size, remaining)
-            seed = np.random.randint(0, 2**30)
-            futures.append(executor.submit(_worker_sim_batch, count, seed))
-            remaining -= count
-            
-        completed = 0
-        for f in concurrent.futures.as_completed(futures):
-            res_scores, res_flags, r_s0, r_s1, r_s2 = f.result()
-            
-            agg_s0 += r_s0
-            agg_s1 += r_s1
-            agg_s2 += r_s2
-            
-            all_scores.append(res_scores)
-            all_flags.append(res_flags)
-            
-            completed += len(res_scores)
-            
+    max_in_flight = cpu_count * 2
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_count) as executor:
+        futures = set()
+        sims_submitted = 0
+        sims_completed = 0
+
+        while sims_completed < total_count:
+            # Submit new tasks only if there is capacity
+            while sims_submitted < total_count and len(futures) < max_in_flight:
+                count = min(batch_size, total_count - sims_submitted)
+                seed = np.random.randint(0, 2**30)
+                futures.add(executor.submit(_worker_sim_batch, count, seed))
+                sims_submitted += count
+
+            # Wait for the next future to complete
+            done, futures = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+
+            for f in done:
+                try:
+                    # Retrieve and aggregate results immediately
+                    (total_sc, sc_bins, ny_nb, ny_yb, yy_nb, yy_yb, s0, s1, s2) = f.result()
+                    agg_total_score += total_sc
+                    agg_score_bins += sc_bins
+                    agg_bins_ny_nb += ny_nb
+                    agg_bins_ny_yb += ny_yb
+                    agg_bins_yy_nb += yy_nb
+                    agg_bins_yy_yb += yy_yb
+                    agg_s0 += s0
+                    agg_s1 += s1
+                    agg_s2 += s2
+                    sims_completed += sum(sc_bins)
+                except Exception as e:
+                    print(f"\nError in worker: {e}")
+                    # Optionally, re-raise or handle the error
+
             elapsed = time.time() - start_time
-            rate = completed / elapsed if elapsed > 0 else 0
-            eta = (total_count - completed) / rate if rate > 0 else 0
-            
-            # Formatted Output
-            pct = completed / total_count * 100
+            rate = sims_completed / elapsed if elapsed > 0 else 0
+            eta = (total_count - sims_completed) / rate if rate > 0 else 0
+            pct = sims_completed / total_count * 100
             print(f"\rSimulating: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta:3.0f}s ", end="")
-            
+
     print() # Newline after loop
-    final_scores = np.concatenate(all_scores)
-    final_flags = np.concatenate(all_flags)
-    
-    return final_scores, final_flags, agg_s0, agg_s1, agg_s2
+    return agg_total_score, agg_score_bins, agg_bins_ny_nb, agg_bins_ny_yb, agg_bins_yy_nb, agg_bins_yy_yb, agg_s0, agg_s1, agg_s2
 
 # --- MAIN EXECUTION ---
 
@@ -383,24 +405,15 @@ def run_suite(args):
     if args.n:
         print(f"\n=== MODE 1: DISTRIBUTION ANALYSIS ({args.n:,} sim) ===")
         start_t = time.time()
-        scores, flags, s0, s1, s2 = run_simulation_parallel(args.n)
+        total_score, score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb, s0, s1, s2 = run_simulation_parallel(args.n)
         print("Processing data...")
-        
-        score_bins = np.bincount(scores, minlength=376)
-        mask_bonus = (flags & 1) > 0
-        mask_yatzy = (flags & 2) > 0
-        
-        bins_ny_nb = np.bincount(scores[~mask_yatzy & ~mask_bonus], minlength=376)
-        bins_ny_yb = np.bincount(scores[~mask_yatzy & mask_bonus], minlength=376)
-        bins_yy_nb = np.bincount(scores[mask_yatzy & ~mask_bonus], minlength=376)
-        bins_yy_yb = np.bincount(scores[mask_yatzy & mask_bonus], minlength=376)
-        
+
         with open(out_dir / f"dist_scores_{ts}.csv", "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["Score", "Count_Total", "NoYatzy_NoBonus", "NoYatzy_YesBonus", "YesYatzy_NoBonus", "YesYatzy_YesBonus"])
             for s in range(376):
                 if score_bins[s] > 0:
-                    w.writerow([s, score_bins[s], bins_ny_nb[s], bins_ny_yb[s], bins_yy_nb[s], bins_yy_yb[s]])
+                    w.writerow([s, int(score_bins[s]), int(bins_ny_nb[s]), int(bins_ny_yb[s]), int(bins_yy_nb[s]), int(bins_yy_yb[s])])
 
         tot_r = args.n * NUM_CATEGORIES
         with open(out_dir / f"dist_categories_{ts}.csv", "w", newline="") as f:
@@ -414,7 +427,7 @@ def run_suite(args):
             "mode": "distribution",
             "count": args.n,
             "elapsed_sec": elapsed_tot,
-            "mean_score": float(np.mean(scores)),
+            "mean_score": total_score / args.n if args.n > 0 else 0,
             "performance": f"{args.n/elapsed_tot:.0f} games/sec"
         }
         with open(out_dir / f"meta_dist_{ts}.json", "w") as f:
@@ -433,7 +446,7 @@ def run_suite(args):
         for step in steps:
             for r in range(reps):
                 print(f"\rRunning simulation: Step {step}, Rep {r+1}/{reps}...", end="")
-                _, _, s0, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)))
+                _, _, _, _, _, _, s0, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)))
                 
                 total_rolls = step * NUM_CATEGORIES
                 obs_probs = s0 / total_rolls
