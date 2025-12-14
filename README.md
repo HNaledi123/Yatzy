@@ -1,8 +1,20 @@
 # Monte Carlo Yatzy Simulations
 
+This project provides a high-performance command-line tool for running Monte Carlo simulations of the game Yatzy. It is built for statistical analysis, allowing users to explore score distributions, category probabilities, and the law of large numbers with respect to game outcomes.
+
+## Key Features
+
+- **High Performance**: Utilizes `Numba` for JIT compilation of the core game loop, achieving millions of simulations per second.
+- **Parallel Execution**: Employs a multi-threaded, constant-memory architecture to efficiently scale across multiple CPU cores.
+- **Two Analysis Modes**:
+  1.  **Distribution Analysis**: Generate detailed statistics from a single, large batch of simulations.
+  2.  **Deviation Study**: Analyze how observed probabilities converge toward theoretical values as the number of simulations increases.
+- **Reproducible AI**: A deterministic, priority-based AI makes decisions for re-rolls and category scoring, ensuring consistent simulation logic.
+- **Detailed Outputs**: Generates CSV and JSON files for easy analysis in other tools like R, Python (with Pandas), or spreadsheet software.
+
 ## Installation
 
-Ensure you have Python 3.x installed. Install required dependencies:
+Ensure you have Python 3.8+ installed. Then, install the required dependencies:
 
 ```bash
 pip install numpy numba
