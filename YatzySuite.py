@@ -476,7 +476,6 @@ def run_suite(args: argparse.Namespace) -> None:
         results = []
         summary_data = {cat: {step: [] for step in steps} for cat in CATEGORY_NAMES}
         timing_data = {step: [] for step in steps}
-        timing_data_warmup_excluded = {step: [] for step in steps}
         
         total_games_in_study = sum(steps) * reps
         games_completed = 0
@@ -490,9 +489,6 @@ def run_suite(args: argparse.Namespace) -> None:
                 _, _, _, _, _, _, stats_roll1, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)))
                 step_elapsed = time.time() - step_start_time
                 timing_data[step].append(step_elapsed)
-                # Exclude first repetition (warmup/JIT compilation) for more accurate stats
-                if r > 0:
-                    timing_data_warmup_excluded[step].append(step_elapsed)
                 
                 games_completed += step
                 total_rolls = step * NUM_CATEGORIES
@@ -548,14 +544,6 @@ def run_suite(args: argparse.Namespace) -> None:
                     "max_sec": max(timing_data[step])
                 }
                 for step in steps
-            },
-            "timing_stats_warmup_excluded": {
-                str(step): {
-                    "avg_sec": sum(timing_data_warmup_excluded[step]) / len(timing_data_warmup_excluded[step]) if timing_data_warmup_excluded[step] else 0,
-                    "min_sec": min(timing_data_warmup_excluded[step]) if timing_data_warmup_excluded[step] else 0,
-                    "max_sec": max(timing_data_warmup_excluded[step]) if timing_data_warmup_excluded[step] else 0
-                }
-                for step in steps
             }
         }
         with open(out_dir / f"meta_study_{ts}.json", "w") as f:
@@ -566,7 +554,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Yatzy Suite: High-Performance Simulation")
     parser.add_argument("--n", type=int, help="Number of simulations for distribution analysis")
     parser.add_argument("--study", type=str, help="Comma-separated list of simulation steps")
-    parser.add_argument("--reps", type=int, default=6, help="Repetitions per step in study mode. First repetition of each step size is used for JIT warmup and excluded from timing statistics (actual stats use reps-1 measurements)")
+    parser.add_argument("--reps", type=int, default=6, help="Repetitions per step in study mode")
     parser.add_argument("--output", type=str, default="results", help="Output directory")
 
     args = parser.parse_args()

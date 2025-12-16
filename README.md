@@ -49,7 +49,7 @@ python YatzySuite.py --study <simulation_steps> [--reps <repetitions>] [--output
 ```
 
 - `--study`: Comma-separated list of simulation counts (e.g., "1000,10000,100000")
-- `--reps`: Number of repetitions per simulation step (default: 6). The first repetition of each step size is used as a JIT warmup and excluded from timing statistics. The `timing_stats_warmup_excluded` field in the metadata reports statistics on `--reps - 1` clean measurements.
+- `--reps`: Number of repetitions per simulation step (default: 6)
 - `--output`: Output directory for results (default: "results")
 
 **Outputs:**
