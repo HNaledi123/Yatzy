@@ -502,9 +502,9 @@ def run_suite(args: argparse.Namespace) -> None:
         
         for i_step, step in enumerate(steps):
             for r in range(reps):
-                print(f"\nRunning Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...")
+                print(f"\r\nRunning Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...")
                 step_start_time = time.time()
-                _, _, _, _, _, _, stats_roll1, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)))
+                _, _, _, _, _, _, stats_roll1, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)), show_progress=False)
                 step_elapsed = time.time() - step_start_time
                 timing_data[step].append(step_elapsed)
                 
