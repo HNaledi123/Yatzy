@@ -96,8 +96,8 @@ def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarr
         7,  # Three of a Kind
         6,  # One Pair
         10, # Two Pairs
-        12, # Large Straight
         11, # Small Straight
+        12, # Large Straight
         13, # Full House
         14  # Chance (fallback)
     ], dtype=np.int8)
