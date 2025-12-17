@@ -348,9 +348,9 @@ def _print_batch_progress(elapsed: float, games_completed: int, total_games: int
     pct = games_completed / total_games * 100
     # Include game count only if the prefix indicates it's a study
     if "Study" in prefix:
-        print(f"{prefix}: {pct:5.1f}% | {games_completed:,}/{total_games:,} games | ETA: {eta:.0f}s ", flush=True)
+        print(f"\r{prefix}: {pct:5.1f}% | {games_completed:,}/{total_games:,} games | ETA: {eta:.0f}s ", end="", flush=True)
     else:
-        print(f"{prefix}: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta:3.0f}s ", flush=True)
+        print(f"\r{prefix}: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta:3.0f}s ", end="", flush=True)
 
 def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -429,6 +429,7 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) 
             elapsed = time.time() - start_time
             _print_batch_progress(elapsed, sims_completed, total_count, "Simulating")
 
+    print() # Newline after loop
     return agg_total_score, agg_score_bins, agg_bins_ny_nb, agg_bins_ny_yb, agg_bins_yy_nb, agg_bins_yy_yb, aggregate_stats_roll1, aggregate_stats_roll2, aggregate_stats_roll3
 
 # --- MAIN EXECUTION ---
