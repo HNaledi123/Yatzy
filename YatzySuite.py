@@ -501,7 +501,8 @@ def run_suite(args: argparse.Namespace) -> None:
             for r in range(reps):
                 print(f"Running Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...")
                 step_start_time = time.time()
-                _, _, _, _, _, _, stats_roll1, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)))
+                study_batch_size = min(100_000, max(1000, step//(os.cpu_count() or 4)))
+                _, _, _, _, _, _, stats_roll1, _, _ = run_simulation_parallel(step, batch_size=study_batch_size)
                 step_elapsed = time.time() - step_start_time
                 timing_data[step].append(step_elapsed)
                 
