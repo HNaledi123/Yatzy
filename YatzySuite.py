@@ -352,7 +352,7 @@ def _print_batch_progress(elapsed: float, games_completed: int, total_games: int
     else:
         print(f"\r{prefix}: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta:3.0f}s ", end="", flush=True)
 
-def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None, show_progress: bool = True) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Runs Yatzy simulations in parallel using a streaming, constant-memory approach.
 
@@ -364,6 +364,7 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) 
         total_count (int): The total number of games to simulate.
         batch_size (int, optional): The number of games per worker batch.
                                     If None, a suitable size is calculated.
+        show_progress (bool): Whether to print progress updates.
 
     Returns:
         tuple: Final aggregated results from all workers.
@@ -372,7 +373,7 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) 
     if batch_size is None:
         target_chunks = cpu_count * 4
         batch_size = max(1000, total_count // target_chunks)
-        batch_size = min(batch_size, 100_000)
+    batch_size = min(batch_size, 100_000)
 
     # Global aggregates
     agg_total_score = 0 # Use Python int for arbitrary precision
@@ -426,10 +427,12 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) 
                     # We must re-raise to stop the program
                     raise e
 
-            elapsed = time.time() - start_time
-            _print_batch_progress(elapsed, sims_completed, total_count, "Simulating")
+            if show_progress:
+                elapsed = time.time() - start_time
+                _print_batch_progress(elapsed, sims_completed, total_count, "Simulating")
 
-    print() # Newline after loop
+    if show_progress:
+        print() # Newline after loop
     return agg_total_score, agg_score_bins, agg_bins_ny_nb, agg_bins_ny_yb, agg_bins_yy_nb, agg_bins_yy_yb, aggregate_stats_roll1, aggregate_stats_roll2, aggregate_stats_roll3
 
 # --- MAIN EXECUTION ---
@@ -499,7 +502,7 @@ def run_suite(args: argparse.Namespace) -> None:
         
         for i_step, step in enumerate(steps):
             for r in range(reps):
-                print(f"Running Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...")
+                print(f"\nRunning Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...")
                 step_start_time = time.time()
                 _, _, _, _, _, _, stats_roll1, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)))
                 step_elapsed = time.time() - step_start_time
@@ -525,7 +528,7 @@ def run_suite(args: argparse.Namespace) -> None:
                 elapsed = time.time() - start_t_study
                 _print_batch_progress(elapsed, games_completed, total_games_in_study, "Overall Study Progress")
 
-        print("\nStudy simulations complete. Saving data...")
+        print("Study simulations complete. Saving data...")
         with open(out_dir / f"study_deviation_{ts}.csv", "w", newline="") as f:
             fields = ["Simulations", "Repetition", "Category", "Expected_Pct", "Observed_Pct", "Abs_Deviation_Pct"]
             w = csv.DictWriter(f, fieldnames=fields)
