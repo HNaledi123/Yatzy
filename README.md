@@ -1,5 +1,21 @@
 # Monte Carlo Yatzy Simulations
 
+> **Note on Game Rules**
+> This simulation implements the **Scandinavian Yatzy** ruleset, which differs from the standard US (Hasbro) version of Yahtzee. Key differences include:
+> - **Bonus**: 50 points for an upper section score of 63 or more (vs. 35 points).
+> - **Straights**: Small Straight is strictly `1-2-3-4-5` (15 pts) and Large Straight is `2-3-4-5-6` (20 pts).
+> - **Full House**: The score is the sum of all dice (e.g., 6,6,6,5,5 scores 28) instead of a fixed 25 points.
+> - **Yatzy Bonus**: There are no bonus points for subsequent Yatzys in the same game.
+
+---
+
+### AI Strategy
+
+The simulation employs a deterministic, "naïve greedy" AI for decision-making.
+
+- **Re-rolls**: The AI's re-roll strategy is to always keep the dice face that appears most frequently in the current roll. This decision is context-blind and does not account for which categories have already been filled.
+- **Scoring**: After the final roll, the AI chooses the available category that yields the highest possible score. A fixed priority list is used only to break ties when multiple categories would give the same score.
+
 This project provides a high-performance command-line tool for running Monte Carlo simulations of the game Yatzy. It is built for statistical analysis, allowing users to explore score distributions, category probabilities, and the law of large numbers with respect to game outcomes.
 
 ## Key Features
