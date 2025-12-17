@@ -333,6 +333,25 @@ def _worker_sim_batch(count: int, seed: int) -> Tuple[int, np.ndarray, np.ndarra
 
 # --- DRIVER LOGIC ---
 
+def _print_batch_progress(elapsed: float, games_completed: int, total_games: int, prefix: str = "Simulating") -> None:
+    """
+    Prints progress information for batch simulations.
+    
+    Args:
+        elapsed (float): Elapsed time in seconds.
+        games_completed (int): Number of games completed so far.
+        total_games (int): Total number of games to complete.
+        prefix (str): Prefix for the progress message.
+    """
+    rate = games_completed / elapsed if elapsed > 0 else 0
+    eta = (float(total_games) - games_completed) / rate if rate > 0 else 0
+    pct = games_completed / total_games * 100
+    # Include game count only if the prefix indicates it's a study
+    if "Study" in prefix:
+        print(f"\r{prefix}: {pct:5.1f}% | {games_completed:,}/{total_games:,} games | ETA: {eta:.0f}s ", end="", flush=True)
+    else:
+        print(f"\r{prefix}: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta:3.0f}s ", end="", flush=True)
+
 def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Runs Yatzy simulations in parallel using a streaming, constant-memory approach.
@@ -408,10 +427,7 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) 
                     raise e
 
             elapsed = time.time() - start_time
-            rate = sims_completed / elapsed if elapsed > 0 else 0
-            eta = (float(total_count) - sims_completed) / rate if rate > 0 else 0
-            pct = sims_completed / total_count * 100
-            print(f"\rSimulating: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta:3.0f}s ", end="")
+            _print_batch_progress(elapsed, sims_completed, total_count, "Simulating")
 
     print() # Newline after loop
     return agg_total_score, agg_score_bins, agg_bins_ny_nb, agg_bins_ny_yb, agg_bins_yy_nb, agg_bins_yy_yb, aggregate_stats_roll1, aggregate_stats_roll2, aggregate_stats_roll3
@@ -483,8 +499,7 @@ def run_suite(args: argparse.Namespace) -> None:
         
         for i_step, step in enumerate(steps):
             for r in range(reps):
-                # Hide the inner progress bar and show a static message
-                print(f"\rRunning Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...          ", end="")
+                print(f"Running Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...")
                 step_start_time = time.time()
                 _, _, _, _, _, _, stats_roll1, _, _ = run_simulation_parallel(step, batch_size=max(1000, step//(os.cpu_count() or 1)))
                 step_elapsed = time.time() - step_start_time
@@ -508,10 +523,7 @@ def run_suite(args: argparse.Namespace) -> None:
                     summary_data[cat][step].append(dev_val)
                 
                 elapsed = time.time() - start_t_study
-                rate = games_completed / elapsed if elapsed > 0 else 0
-                eta = (total_games_in_study - games_completed) / rate if rate > 0 else 0
-                pct = games_completed / total_games_in_study * 100
-                print(f"\nOverall Study Progress: {pct:5.1f}% | {games_completed:,}/{total_games_in_study:,} games | ETA: {eta:.0f}s")
+                _print_batch_progress(elapsed, games_completed, total_games_in_study, "Overall Study Progress")
 
         print("\nStudy simulations complete. Saving data...")
         with open(out_dir / f"study_deviation_{ts}.csv", "w", newline="") as f:
@@ -554,7 +566,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Yatzy Suite: High-Performance Simulation")
     parser.add_argument("--n", type=int, help="Number of simulations for distribution analysis")
     parser.add_argument("--study", type=str, help="Comma-separated list of simulation steps")
-    parser.add_argument("--reps", type=int, default=6, help="Repetitions per step in study mode")
+    parser.add_argument("--reps", type=int, default=5, help="Repetitions per step in study mode")
     parser.add_argument("--output", type=str, default="results", help="Output directory")
 
     args = parser.parse_args()
