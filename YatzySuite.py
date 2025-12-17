@@ -333,6 +333,19 @@ def _worker_sim_batch(count: int, seed: int) -> Tuple[int, np.ndarray, np.ndarra
 
 # --- DRIVER LOGIC ---
 
+def _format_time(seconds: float) -> str:
+    """Formats seconds into a HH:MM:SS or MM:SS string."""
+    if seconds is None or seconds < 0 or seconds == float('inf'):
+        return "--:--"
+
+    s = int(seconds)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
 def _print_batch_progress(elapsed: float, games_completed: int, total_games: int, prefix: str = "Simulating") -> None:
     """
     Prints progress information for batch simulations.
@@ -346,11 +359,14 @@ def _print_batch_progress(elapsed: float, games_completed: int, total_games: int
     rate = games_completed / elapsed if elapsed > 0 else 0
     eta = (float(total_games) - games_completed) / rate if rate > 0 else 0
     pct = games_completed / total_games * 100
+    eta_str = _format_time(eta)
     # Include game count only if the prefix indicates it's a study
+    # Pad the output with spaces to clear artifacts from previous, longer lines.
+    # A width of 80 characters is a safe default for most terminals.
     if "Study" in prefix:
-        print(f"\r{prefix}: {pct:5.1f}% | {games_completed:,}/{total_games:,} games | ETA: {eta:.0f}s ", end="", flush=True)
+        print(f"\r{prefix}: {pct:5.1f}% | {games_completed:,}/{total_games:,} games | ETA: {eta_str}".ljust(80), end="", flush=True)
     else:
-        print(f"\r{prefix}: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta:3.0f}s ", end="", flush=True)
+        print(f"\r{prefix}: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta_str}".ljust(80), end="", flush=True)
 
 def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
