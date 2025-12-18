@@ -368,7 +368,7 @@ def _print_batch_progress(elapsed: float, games_completed: int, total_games: int
     else:
         print(f"\r{prefix}: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta_str}".ljust(80), end="", flush=True)
 
-def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None, quiet: bool = False) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Runs Yatzy simulations in parallel using a streaming, constant-memory approach.
 
@@ -380,6 +380,7 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) 
         total_count (int): The total number of games to simulate.
         batch_size (int, optional): The number of games per worker batch.
                                     If None, a suitable size is calculated.
+        quiet (bool, optional): If True, suppress progress output. Defaults to False.
 
     Returns:
         tuple: Final aggregated results from all workers.
@@ -443,9 +444,11 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None) 
                     raise e
 
             elapsed = time.time() - start_time
-            _print_batch_progress(elapsed, sims_completed, total_count, "Simulating")
+            if not quiet:
+                _print_batch_progress(elapsed, sims_completed, total_count, "Simulating")
 
-    print() # Newline after loop
+    if not quiet:
+        print() # Newline after loop
     return agg_total_score, agg_score_bins, agg_bins_ny_nb, agg_bins_ny_yb, agg_bins_yy_nb, agg_bins_yy_yb, aggregate_stats_roll1, aggregate_stats_roll2, aggregate_stats_roll3
 
 # --- MAIN EXECUTION ---
@@ -502,9 +505,7 @@ def run_suite(args: argparse.Namespace) -> None:
         steps = [int(x) for x in args.study.split(",")]
         reps = args.reps
         print(f"\n=== MODE 2: DEVIATION STUDY ({len(steps)} steps, {reps} reps/step) ===")
-        print("Warming up JIT compiler...", end="", flush=True)
-        _ = run_simulation_parallel(1, batch_size=1)
-        print(" Done.")
+        _ = run_simulation_parallel(1, batch_size=1, quiet=True)
         results = []
         summary_data = {cat: {step: [] for step in steps} for cat in CATEGORY_NAMES}
         timing_data = {step: [] for step in steps}
