@@ -469,7 +469,7 @@ def run_suite(args: argparse.Namespace) -> None:
         print(f"\n=== MODE 1: DISTRIBUTION ANALYSIS ({args.n:,} sim) ===")
         start_t = time.time()
         total_score, score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb, stats_roll1, stats_roll2, stats_roll3 = run_simulation_parallel(args.n)
-        print("Processing data...")
+        print("Simulations complete. Processing data...")
 
         with open(out_dir / f"dist_scores_{ts}.csv", "w", newline="") as f:
             w = csv.writer(f)
@@ -515,7 +515,7 @@ def run_suite(args: argparse.Namespace) -> None:
         
         for i_step, step in enumerate(steps):
             for r in range(reps):
-                print(f"Running Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...")
+                print(f"\nRunning Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...")
                 step_start_time = time.time()
                 study_batch_size = min(100_000, max(1000, step//(os.cpu_count() or 4)))
                 _, _, _, _, _, _, stats_roll1, _, _ = run_simulation_parallel(step, batch_size=study_batch_size)
@@ -542,7 +542,7 @@ def run_suite(args: argparse.Namespace) -> None:
                 elapsed = time.time() - start_t_study
                 _print_batch_progress(elapsed, games_completed, total_games_in_study, "Overall Study Progress")
 
-        print("\nStudy simulations complete. Saving data...")
+        print("\nSimulations complete. Processing data...")
         with open(out_dir / f"study_deviation_{ts}.csv", "w", newline="") as f:
             fields = ["Simulations", "Repetition", "Category", "Expected_Pct", "Observed_Pct", "Abs_Deviation_Pct"]
             w = csv.DictWriter(f, fieldnames=fields)
@@ -577,7 +577,7 @@ def run_suite(args: argparse.Namespace) -> None:
         }
         with open(out_dir / f"meta_study_{ts}.json", "w") as f:
             json.dump(meta_study, f, indent=2)
-        print(f"Study saved to {out_dir}")
+        print(f"Done! Data saved to {out_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Yatzy Suite: High-Performance Simulation")
