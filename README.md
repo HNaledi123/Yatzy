@@ -1,11 +1,15 @@
 # Monte Carlo Yatzy Simulations
 
-> **Note on Game Rules**
-> This simulation implements the **Scandinavian Yatzy** ruleset, which differs from the standard US (Hasbro) version of Yahtzee. Key differences include:
-> - **Bonus**: 50 points for an upper section score of 63 or more (vs. 35 points).
-> - **Straights**: Small Straight is strictly `1-2-3-4-5` (15 pts) and Large Straight is `2-3-4-5-6` (20 pts).
-> - **Full House**: The score is the sum of all dice (e.g., 6,6,6,5,5 scores 28) instead of a fixed 25 points.
-> - **Yatzy Bonus**: There are no bonus points for subsequent Yatzys in the same game.
+A high-performance Monte Carlo simulation suite for analyzing Yatzy game statistics and probability distributions. This project enables statistical exploration of score outcomes, category probabilities, and convergence behavior across millions of simulated games.
+
+## Game Rules
+
+This simulation implements the **Scandinavian Yatzy** ruleset, which differs from the more common US (Hasbro) version of Yahtzee. Key differences include:
+- **Bonus**: 50 points for an upper section score of 63 or more (vs. 35 points).
+- **Straights**: Small Straight is strictly `1-2-3-4-5` (15 pts) and Large Straight is `2-3-4-5-6` (20 pts).
+- **Full House**: The score is the sum of all dice (e.g., 6,6,6,5,5 scores 28) instead of a fixed 25 points.
+- **Yatzy Bonus**: There are no bonus points for subsequent Yatzys in the same game.
+- **Maximum Score**: 374 points (theoretical maximum)
 
 ---
 
@@ -27,6 +31,8 @@ This project provides a high-performance command-line tool for running Monte Car
   2.  **Deviation Study**: Analyze how observed probabilities converge toward theoretical values as the number of simulations increases.
 - **Reproducible AI**: A deterministic, priority-based AI makes decisions for re-rolls and category scoring, ensuring consistent simulation logic.
 - **Detailed Outputs**: Generates CSV and JSON files for easy analysis in other tools like R, Python (with Pandas), or spreadsheet software.
+- **Pre-computed Lookup Tables**: Generates 7,776 dice roll outcomes (6^5) at startup for O(1) category scoring and re-roll decisions.
+- **Statistical Validation**: Uses exact combinatorial probabilities (7,776 total outcomes) to measure convergence in deviation studies.
 
 ## Installation
 
@@ -89,3 +95,33 @@ Save results to custom directory:
 ```bash
 python YatzySuite.py --n 500000 --output my_results
 ```
+
+## AI Strategy
+
+The simulation employs a deterministic, context-blind AI for decision-making:
+
+- **Re-roll Strategy**: The AI always keeps the dice face that appears most frequently in the current roll. This greedy approach does not account for which categories have already been filled, making it a "naïve" strategy but consistent and reproducible.
+- **Scoring Strategy**: After the final roll, the AI chooses the available category that yields the highest possible score. A fixed priority list (Sixes → Aces → Yatzy → Four of a Kind → ... → Chance) is used only to break ties when multiple categories would give the same score.
+
+This deterministic behavior ensures that simulations are reproducible and makes the AI's decision-making easy to analyze and understand.
+
+## Project Structure
+
+```
+YatzySuite.py           # Main simulation engine
+README.md               # This file
+results/                # Output directory for simulation results
+  ├── dist_*.csv       # Distribution analysis outputs
+  ├── study_*.csv      # Deviation study outputs
+  └── meta_*.json      # Metadata for runs
+```
+
+## How It Works
+
+1. **Lookup Table Generation**: At startup, all 7,776 possible dice roll outcomes (6^5) are pre-computed to determine scores and re-roll decisions for all categories.
+2. **Game Simulation**: For each simulated game:
+   - Roll 5 dice three times, with re-rolls determined by the AI strategy
+   - After each roll, compute statistics on which categories are achievable
+   - Place the final score in the highest-scoring available category
+3. **Parallel Batching**: Multiple CPU cores process independent simulation batches simultaneously, with constant memory usage.
+4. **Statistical Analysis**: Results are aggregated and analyzed to compute distributions, probabilities, and convergence metrics.
