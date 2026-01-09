@@ -1,3 +1,14 @@
+# --- DEPENDENCY CHECKS ---
+
+dependencies = ["np", "numba"]
+for dep in dependencies:
+    try:
+        __import__(dep)
+    except ImportError:
+        sys.exit(f"Error: {dep} is required. Please install it using 'pip install {dep}'.")
+
+# --- IMPORTS ---
+
 import argparse
 import csv
 import json
@@ -6,22 +17,11 @@ import os
 import time
 import sys
 import concurrent.futures
+import numpy as np
+from itertools import product
 from typing import Tuple, Optional
 from pathlib import Path
-
-# --- DEPENDENCY CHECKS ---
-try:
-    import numpy as np
-except ImportError:
-    sys.exit("Error: Numpy is required. Please install it using 'pip install numpy'.")
-
-try:
-    from numba import njit
-except ImportError:
-    sys.exit("Error: Numba is required. Please install it using 'pip install numba'.")
-
-# Promote numpy warnings (like overflow) to exceptions to halt execution
-np.seterr(all='raise')
+from numba import njit
 
 # --- CONFIGURATION & CONSTANTS ---
 
@@ -35,55 +35,53 @@ NUM_CATEGORIES = 15
 DICE_COUNT = 5
 DICE_FACES = 6
 ROLL_STATE_COUNT = DICE_FACES ** DICE_COUNT
-MAX_SCORE = 374 # Theoretical maximum score in Yatzy
+MAX_SCORE = 374
 SCORE_BINS_SIZE = MAX_SCORE + 1
-# Mapping strict logic indices
-OF_A_KIND_TO_IDX = {2: 6, 3: 7, 4: 8, 5: 9}
-YATZY_IDX = 9
+YATZY_INDEX = 9
 
-# Exact probabilities based on 7776 outcomes (6^5)
+# Exact probabilities based on 7776 possible outcomes (6^5)
 EXPECTED_PROBS = np.array([
-    4651 / ROLL_STATE_COUNT,  # Aces
-    4651 / ROLL_STATE_COUNT,  # Twos
-    4651 / ROLL_STATE_COUNT,  # Threes
-    4651 / ROLL_STATE_COUNT,  # Fours
-    4651 / ROLL_STATE_COUNT,  # Fives
-    4651 / ROLL_STATE_COUNT,  # Sixes
-    7056 / ROLL_STATE_COUNT,  # One Pair
-    1656 / ROLL_STATE_COUNT,  # Three of a Kind
-    156  / ROLL_STATE_COUNT,  # Four of a Kind
-    6    / ROLL_STATE_COUNT,  # Yatzy
-    2100 / ROLL_STATE_COUNT,  # Two Pairs
-    120  / ROLL_STATE_COUNT,  # Small Straight
-    120  / ROLL_STATE_COUNT,  # Large Straight
-    300  / ROLL_STATE_COUNT,  # Full House
-    1.0         # Chance
+    4651 / ROLL_STATE_COUNT,    # Aces
+    4651 / ROLL_STATE_COUNT,    # Twos
+    4651 / ROLL_STATE_COUNT,    # Threes
+    4651 / ROLL_STATE_COUNT,    # Fours
+    4651 / ROLL_STATE_COUNT,    # Fives
+    4651 / ROLL_STATE_COUNT,    # Sixes
+    7056 / ROLL_STATE_COUNT,    # One Pair
+    1656 / ROLL_STATE_COUNT,    # Three of a Kind
+    156  / ROLL_STATE_COUNT,    # Four of a Kind
+    6    / ROLL_STATE_COUNT,    # Yatzy
+    2100 / ROLL_STATE_COUNT,    # Two Pairs
+    120  / ROLL_STATE_COUNT,    # Small Straight
+    120  / ROLL_STATE_COUNT,    # Large Straight
+    300  / ROLL_STATE_COUNT,    # Full House
+    1.0                         # Chance
 ])
 
 # --- LOOKUP TABLE GENERATION ---
 
 def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Generates lookup tables for all possible 7776 dice roll outcomes (6^5).
+    Generates lookup tables for all possible dice roll outcomes.
 
     This function pre-calculates and caches:
     - scores: The score for each category for every possible dice roll.
-    - sat_mask: A boolean mask indicating if a category is satisfied (achieved).
-    - keep_val: The face value of the dice to keep for the AI re-roll strategy.
-    - keep_cnt: The count of dice to keep for the AI re-roll strategy.
-    - priority: An array defining the AI's preferred order for choosing categories.
+    - satisfaction_mask: A boolean mask indicating if a category is achieved (satisifed).
+    - keep_value: The face value of the dice to keep for the AI re-roll strategy.
+    - keep_count: The count of dice to keep for the AI re-roll strategy.
+    - priority: An array defining the preferred order for choosing categories.
 
     Returns:
-        tuple: A tuple containing the generated numpy arrays:
-               (scores, sat_mask, keep_val, keep_cnt, priority).
+        tuple: A tuple containing the generated np arrays:
+               (scores, satisfaction_mask, keep_value, keep_count, priority).
     """
-    from itertools import product
     scores = np.zeros((ROLL_STATE_COUNT, NUM_CATEGORIES), dtype=np.int16)
-    sat_mask = np.zeros((ROLL_STATE_COUNT, NUM_CATEGORIES), dtype=np.uint8)
-    keep_val = np.zeros(ROLL_STATE_COUNT, dtype=np.int8)
-    keep_cnt = np.zeros(ROLL_STATE_COUNT, dtype=np.int8)
+    satisfaction_mask = np.zeros((ROLL_STATE_COUNT, NUM_CATEGORIES), dtype=np.uint8)
+    keep_value = np.zeros(ROLL_STATE_COUNT, dtype=np.int8)
+    keep_count = np.zeros(ROLL_STATE_COUNT, dtype=np.int8)
 
-    # This array defines the order in which the AI checks for available categories to score
+    # In case of tie, prefer earlier entries in this array
+    # IDs correspond to the order in which they were named in CATEGORY_NAMES
     priority = np.array([
         5,  # Sixes
         4,  # Fives
@@ -99,57 +97,55 @@ def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarr
         11, # Small Straight
         12, # Large Straight
         13, # Full House
-        14  # Chance (fallback)
+        14  # Chance
     ], dtype=np.int8)
 
-    for idx, dice in enumerate(product(range(1, DICE_FACES + 1), repeat=DICE_COUNT)):
-        d_arr = np.array(dice, dtype=np.int8)
-        counts = np.bincount(d_arr, minlength=7)
-        s_dice = np.sort(d_arr)
-        d_sum = d_arr.sum()
+    for index, dice in enumerate(product(range(1, DICE_FACES + 1), repeat=DICE_COUNT)):
+        dice_array = np.array(dice, dtype=np.int8)
+        counts = np.bincount(dice_array, minlength=7) # Counts[0] unused
 
         # Upper Section (Aces through Sixes)
-        for f in range(1, 7):
-            scores[idx, f-1] = counts[f] * f
-            if counts[f] > 0: sat_mask[idx, f-1] = 1
+        for face in range(1, 7):
+            scores[index, face-1] = counts[face] * face
+            if counts[face] > 0: satisfaction_mask[index, face-1] = 1
         
-        # X of a Kind
-        for k, p_idx in OF_A_KIND_TO_IDX.items():
-            if k == 5: 
+        # N of a Kind (2-5)
+        for count in range(2, 6):
+            if count == 5:
                 if np.any(counts[1:] >= 5):
-                    scores[idx, p_idx] = 50
-                    sat_mask[idx, p_idx] = 1
+                    scores[index, count+4] = 50
+                    satisfaction_mask[index, count+4] = 1
             else:
-                for f in range(6, 0, -1):
-                    if counts[f] >= k:
-                        scores[idx, p_idx] = f * k
-                        sat_mask[idx, p_idx] = 1
+                for face in range(6, 0, -1):
+                    if counts[face] >= count:
+                        scores[index, count+4] = face * count
+                        satisfaction_mask[index, count+4] = 1
                         break
         
         # Two Pairs
         pairs = [f for f in range(1, 7) if counts[f] >= 2]
         if len(pairs) >= 2:
-            scores[idx, 10] = pairs[-1]*2 + pairs[-2]*2
-            sat_mask[idx, 10] = 1
+            scores[index, 10] = pairs[-1]*2 + pairs[-2]*2
+            satisfaction_mask[index, 10] = 1
             
         # Straights
-        u_vals = np.unique(s_dice)
+        u_vals = np.unique(dice_array)
         if np.array_equal(u_vals, [1,2,3,4,5]): 
-            scores[idx, 11] = 15
-            sat_mask[idx, 11] = 1
+            scores[index, 11] = 15
+            satisfaction_mask[index, 11] = 1
         if np.array_equal(u_vals, [2,3,4,5,6]): 
-            scores[idx, 12] = 20
-            sat_mask[idx, 12] = 1
+            scores[index, 12] = 20
+            satisfaction_mask[index, 12] = 1
             
         # Full House
         if np.any(counts == 3) and np.any(counts == 2):
             # Score is the sum of all dice, which is correct for a Full House.
-            scores[idx, 13] = (np.where(counts==3)[0][0]*3 + np.where(counts==2)[0][0]*2)
-            sat_mask[idx, 13] = 1
+            scores[index, 13] = (np.where(counts==3)[0][0]*3 + np.where(counts==2)[0][0]*2)
+            satisfaction_mask[index, 13] = 1
 
         # Chance
-        scores[idx, 14] = d_sum
-        sat_mask[idx, 14] = 1
+        scores[index, 14] = dice_array.sum()
+        satisfaction_mask[index, 14] = 1
 
         # Pre-calc keep strategy: find the face value with the highest count.
         c_no_zero = counts[1:]
@@ -159,13 +155,13 @@ def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarr
             if counts[f] == mx:
                 kv = f
                 break
-        keep_val[idx] = kv
-        keep_cnt[idx] = mx
+        keep_value[index] = kv
+        keep_count[index] = mx
 
-    return scores, sat_mask, keep_val, keep_cnt, priority
+    return scores, satisfaction_mask, keep_value, keep_count, priority
 
 print("Building lookup tables...", end="", flush=True)
-TBL_SCORES, TBL_SAT, TBL_KEEP_VAL, TBL_KEEP_CNT, TBL_PRIO = _build_lookup_tables()
+TBL_SCORES, TBL_SAT, TBL_KEEP_VALUE, TBL_KEEP_COUNT, TBL_PRIO = _build_lookup_tables()
 print("Done.")
 
 # --- OPTIMIZED NUMBA FUNCTIONS ---
@@ -180,7 +176,7 @@ def _encode(dice: np.ndarray) -> int:
     e.g., (d1-1)*6^4 + (d2-1)*6^3 + ... + (d5-1)*6^0
 
     Args:
-        dice (np.ndarray): A numpy array of 5 integers (1-6) representing the dice.
+        dice (np.ndarray): A np array of 5 integers (1-6) representing the dice.
 
     Returns:
         int: The unique integer index for the roll.
@@ -191,19 +187,19 @@ def _encode(dice: np.ndarray) -> int:
     return k
 
 @njit(nogil=True)
-def _ai_reroll(dice: np.ndarray, roll_idx: int, out: np.ndarray) -> None:
+def _ai_reroll(dice: np.ndarray, roll_index: int, out: np.ndarray) -> None:
     """
     Determines which dice to re-roll based on a simple AI strategy.
     The strategy is to keep the dice that appear most frequently.
     The new roll (with some dice kept, some re-rolled) is placed in `out`.
     """
-    cnt = TBL_KEEP_CNT[roll_idx]
+    cnt = TBL_KEEP_COUNT[roll_index]
     if cnt == 5:
         for i in range(DICE_COUNT):
             out[i] = dice[i]
         return
         
-    val = TBL_KEEP_VAL[roll_idx]
+    val = TBL_KEEP_VALUE[roll_index]
     for i in range(cnt): 
         out[i] = val
     for i in range(cnt, DICE_COUNT): 
@@ -240,29 +236,29 @@ def _play_game_optimized(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndar
         # Roll 1
         for i in range(DICE_COUNT): 
             d0[i] = np.random.randint(1, 7)
-        idx0 = _encode(d0)
+        index0 = _encode(d0)
         
-        row0 = TBL_SAT[idx0]
+        row0 = TBL_SAT[index0]
         for c in range(NUM_CATEGORIES): 
             stats0[c] += row0[c]
         
         # Roll 2
-        _ai_reroll(d0, idx0, d1)
-        idx1 = _encode(d1)
-        row1 = TBL_SAT[idx1]
+        _ai_reroll(d0, index0, d1)
+        index1 = _encode(d1)
+        row1 = TBL_SAT[index1]
         for c in range(NUM_CATEGORIES): 
             stats1[c] += row1[c]
         
         # Roll 3
-        _ai_reroll(d1, idx1, d2)
-        idx2 = _encode(d2)
-        row2 = TBL_SAT[idx2]
+        _ai_reroll(d1, index1, d2)
+        index2 = _encode(d2)
+        row2 = TBL_SAT[index2]
         for c in range(NUM_CATEGORIES): 
             stats2[c] += row2[c]
         
         best_sc = -1
         best_id = -1
-        scores = TBL_SCORES[idx2]
+        scores = TBL_SCORES[index2]
         
         for i in range(NUM_CATEGORIES):
             cat = TBL_PRIO[i]
@@ -275,7 +271,7 @@ def _play_game_optimized(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndar
         total += best_sc
         if best_id < 6: 
             upper += best_sc
-        if best_id == YATZY_IDX and best_sc > 0: 
+        if best_id == YATZY_INDEX and best_sc > 0: 
             got_yatzy = True
         
         allowed_categories &= ~(1 << best_id)
