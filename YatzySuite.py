@@ -1,6 +1,7 @@
 # --- DEPENDENCY CHECKS ---
+import sys
 
-dependencies = ["np", "numba"]
+dependencies = ["numpy", "numba"]
 for dep in dependencies:
     try:
         __import__(dep)
@@ -123,23 +124,22 @@ def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarr
                         break
         
         # Two Pairs
-        pairs = [f for f in range(1, 7) if counts[f] >= 2]
+        pairs = [face for face in range(1, 7) if counts[face] >= 2]
         if len(pairs) >= 2:
             scores[index, 10] = pairs[-1]*2 + pairs[-2]*2
             satisfaction_mask[index, 10] = 1
             
         # Straights
-        u_vals = np.unique(dice_array)
-        if np.array_equal(u_vals, [1,2,3,4,5]): 
+        unique_values = np.unique(dice_array)
+        if np.array_equal(unique_values, [1,2,3,4,5]): 
             scores[index, 11] = 15
             satisfaction_mask[index, 11] = 1
-        if np.array_equal(u_vals, [2,3,4,5,6]): 
+        if np.array_equal(unique_values, [2,3,4,5,6]): 
             scores[index, 12] = 20
             satisfaction_mask[index, 12] = 1
             
         # Full House
         if np.any(counts == 3) and np.any(counts == 2):
-            # Score is the sum of all dice, which is correct for a Full House.
             scores[index, 13] = (np.where(counts==3)[0][0]*3 + np.where(counts==2)[0][0]*2)
             satisfaction_mask[index, 13] = 1
 
@@ -147,24 +147,18 @@ def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarr
         scores[index, 14] = dice_array.sum()
         satisfaction_mask[index, 14] = 1
 
-        # Pre-calc keep strategy: find the face value with the highest count.
-        c_no_zero = counts[1:]
-        mx = c_no_zero.max()
-        kv = 1
-        for f in range(6, 0, -1):
-            if counts[f] == mx:
-                kv = f
-                break
-        keep_value[index] = kv
-        keep_count[index] = mx
+        # Pre-calculate the keep strategy: find the face value with the highest count.
+        max_count = counts.max()
+        keep_value[index] = max(face for face in range(1, 7) if counts[face] == max_count)
+        keep_count[index] = max_count
 
     return scores, satisfaction_mask, keep_value, keep_count, priority
 
 print("Building lookup tables...", end="", flush=True)
 TBL_SCORES, TBL_SAT, TBL_KEEP_VALUE, TBL_KEEP_COUNT, TBL_PRIO = _build_lookup_tables()
-print("Done.")
+print(" Done.")
 
-# --- OPTIMIZED NUMBA FUNCTIONS ---
+# --- NUMBA FUNCTIONS ---
 
 @njit(nogil=True)
 def _encode(dice: np.ndarray) -> int:
