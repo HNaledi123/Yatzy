@@ -38,7 +38,7 @@ DICE_FACES = 6
 ROLL_STATE_COUNT = DICE_FACES ** DICE_COUNT
 MAX_SCORE = 374
 SCORE_BINS_SIZE = MAX_SCORE + 1
-YATZY_INDEX = 9
+YATZY_INDEX = 9 # "Yatzy" is ninth in the CATEGORY_NAMES array.
 
 # Exact probabilities based on 7776 possible outcomes (6^5)
 EXPECTED_PROBS = np.array([
@@ -68,8 +68,8 @@ def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarr
     This function pre-calculates and caches:
     - scores: The score for each category for every possible dice roll.
     - satisfaction_mask: A boolean mask indicating if a category is achieved (satisifed).
-    - keep_value: The face value of the dice to keep for the AI re-roll strategy.
-    - keep_count: The count of dice to keep for the AI re-roll strategy.
+    - keep_value: The face value of the dice to keep for the re-roll strategy.
+    - keep_count: The count of dice to keep for the re-roll strategy.
     - priority: An array defining the preferred order for choosing categories.
 
     Returns:
@@ -155,7 +155,7 @@ def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarr
     return scores, satisfaction_mask, keep_value, keep_count, priority
 
 print("Building lookup tables...", end="", flush=True)
-TBL_SCORES, TBL_SAT, TBL_KEEP_VALUE, TBL_KEEP_COUNT, TBL_PRIO = _build_lookup_tables()
+LOOKUP_SCORES, LOOKUP_SATISFACTION_MASK, LOOKUP_KEEP_VALUE, LOOKUP_KEEP_COUNT, LOOKUP_PRIORITY = _build_lookup_tables()
 print(" Done.")
 
 # --- NUMBA FUNCTIONS ---
@@ -164,10 +164,6 @@ print(" Done.")
 def _encode(dice: np.ndarray) -> int:
     """
     Encodes a 5-dice roll into a unique integer index from 0 to 7775.
-
-    This treats the dice roll as a base-6 number, allowing it to be used
-    as an index into the pre-calculated lookup tables.
-    e.g., (d1-1)*6^4 + (d2-1)*6^3 + ... + (d5-1)*6^0
 
     Args:
         dice (np.ndarray): A np array of 5 integers (1-6) representing the dice.
@@ -181,26 +177,26 @@ def _encode(dice: np.ndarray) -> int:
     return k
 
 @njit(nogil=True)
-def _ai_reroll(dice: np.ndarray, roll_index: int, out: np.ndarray) -> None:
+def _reroll(dice: np.ndarray, roll_index: int, out: np.ndarray) -> None:
     """
-    Determines which dice to re-roll based on a simple AI strategy.
+    Determines which dice to re-roll based on a simple strategy.
     The strategy is to keep the dice that appear most frequently.
     The new roll (with some dice kept, some re-rolled) is placed in `out`.
     """
-    cnt = TBL_KEEP_COUNT[roll_index]
+    cnt = LOOKUP_KEEP_COUNT[roll_index]
     if cnt == 5:
         for i in range(DICE_COUNT):
             out[i] = dice[i]
         return
         
-    val = TBL_KEEP_VALUE[roll_index]
+    val = LOOKUP_KEEP_VALUE[roll_index]
     for i in range(cnt): 
         out[i] = val
     for i in range(cnt, DICE_COUNT): 
         out[i] = np.random.randint(1, 7)
 
 @njit(nogil=True)
-def _play_game_optimized(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndarray, d0: np.ndarray, d1: np.ndarray, d2: np.ndarray) -> Tuple[int, bool, bool]:
+def _play_game(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndarray, d0: np.ndarray, d1: np.ndarray, d2: np.ndarray) -> Tuple[int, bool, bool]:
     """
     Simulates a single, complete game of Yatzy using an optimized, Numba-jitted function.
 
@@ -232,30 +228,30 @@ def _play_game_optimized(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndar
             d0[i] = np.random.randint(1, 7)
         index0 = _encode(d0)
         
-        row0 = TBL_SAT[index0]
+        row0 = LOOKUP_SATISFACTION_MASK[index0]
         for c in range(NUM_CATEGORIES): 
             stats0[c] += row0[c]
         
         # Roll 2
-        _ai_reroll(d0, index0, d1)
+        _reroll(d0, index0, d1)
         index1 = _encode(d1)
-        row1 = TBL_SAT[index1]
+        row1 = LOOKUP_SATISFACTION_MASK[index1]
         for c in range(NUM_CATEGORIES): 
             stats1[c] += row1[c]
         
         # Roll 3
-        _ai_reroll(d1, index1, d2)
+        _reroll(d1, index1, d2)
         index2 = _encode(d2)
-        row2 = TBL_SAT[index2]
+        row2 = LOOKUP_SATISFACTION_MASK[index2]
         for c in range(NUM_CATEGORIES): 
             stats2[c] += row2[c]
         
         best_sc = -1
         best_id = -1
-        scores = TBL_SCORES[index2]
+        scores = LOOKUP_SCORES[index2]
         
         for i in range(NUM_CATEGORIES):
-            cat = TBL_PRIO[i]
+            cat = LOOKUP_PRIORITY[i]
             if (allowed_categories >> cat) & 1:
                 s = scores[cat]
                 if s > best_sc:
@@ -307,7 +303,7 @@ def _worker_sim_batch(count: int, seed: int) -> Tuple[int, np.ndarray, np.ndarra
     d2 = np.empty(DICE_COUNT, dtype=np.int8)
 
     for i in range(count):
-        score, has_bonus, has_yatzy = _play_game_optimized(local_stats_roll1, local_stats_roll2, local_stats_roll3, d0, d1, d2)
+        score, has_bonus, has_yatzy = _play_game(local_stats_roll1, local_stats_roll2, local_stats_roll3, d0, d1, d2)
         total_score += score
         score_bins[score] += 1
         if not has_yatzy and not has_bonus:
@@ -350,9 +346,6 @@ def _print_batch_progress(elapsed: float, games_completed: int, total_games: int
     eta = (float(total_games) - games_completed) / rate if rate > 0 else 0
     pct = games_completed / total_games * 100
     eta_str = _format_time(eta)
-    # Include game count only if the prefix indicates it's a study
-    # Pad the output with spaces to clear artifacts from previous, longer lines.
-    # A width of 80 characters is a safe default for most terminals.
     if "Study" in prefix:
         print(f"\r{prefix}: {pct:5.1f}% | {games_completed:,}/{total_games:,} games | ETA: {eta_str}".ljust(80), end="", flush=True)
     else:
@@ -382,7 +375,7 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None, 
         batch_size = min(batch_size, 100_000)
 
     # Global aggregates
-    agg_total_score = 0 # Use Python int for arbitrary precision
+    agg_total_score = 0
     agg_score_bins = np.zeros(SCORE_BINS_SIZE, dtype=object)
     agg_bins_ny_nb = np.zeros(SCORE_BINS_SIZE, dtype=object)
     agg_bins_ny_yb = np.zeros(SCORE_BINS_SIZE, dtype=object)
@@ -397,8 +390,8 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None, 
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_count) as executor:
         futures = set()
-        sims_submitted = 0 # Use Python int
-        sims_completed = 0 # Use Python int
+        sims_submitted = 0 
+        sims_completed = 0 
 
         while sims_completed < total_count:
             # Submit new tasks only if there is capacity
