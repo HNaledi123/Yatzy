@@ -5,23 +5,21 @@ High-performance Monte Carlo simulations for **Scandinavian Yatzy**, focused on 
 ## Usage & Outputs
 
 ### Distribution analysis
-Outputs a table of the amount of simulated Yatzy games which achieved a specific point total `dist_scores` as well as the overall measured probabilities of fulfilling the requirements of a space `dist_categories`.
+Outputs a table of the amount of simulated Yatzy games which achieved a specific point total to `dist_scores` as well as the overall measured probabilities of fulfilling the requirements of a space to `dist_categories`. Input a positive integer for the amount of games to simulate as `n`.
 
 ```bash
 python YatzySuite.py --n 1000000
 ```
 
 ### Deviation study
-Outputs a table of the average deviation in percentage points between measured probabilities for games of a given size and true value of fulfilling the requirements of a space `study_summary`, and a full table of the individual probabilties in all simulated games `study_deviation`.
-
-Default reps: 5
+Outputs a table of the average deviation in percentage points between measured probabilities for games of a given size and true value of fulfilling the requirements of a space to `study_summary`, and a full table of the individual probabilties in all simulated games to `study_deviation`. Input a comma-separated list of positive integers for the amount of games to simulate as `study`. Input a positive integer for the amount of times to repeat each study size as `reps` (default 5).
 
 ```bash
 python YatzySuite.py --study 1000,10000,100000 --reps 10
 ```
 
 ### Custom output directory
-Default output: results
+A new folder is created in the directory where YatzySuite.py is run. Default output: results
 
 ```bash
 python YatzySuite.py --n 500000 --output my_results
@@ -37,4 +35,4 @@ results/
   study_summary_*.csv
   meta_*.json
 ```
-Where * is replaced with the time (seconds since the epoch) the simulation was initiated.
+Where * is replaced with the time (in seconds since the epoch) the simulation was initiated.
