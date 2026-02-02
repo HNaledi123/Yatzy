@@ -1,7 +1,7 @@
 # --- DEPENDENCY CHECKS ---
 import sys
 
-dependencies = ["numpy", "numba"]
+dependencies = ["numpy", "numba", "matplotlib"]
 for dep in dependencies:
     try:
         __import__(dep)
@@ -18,7 +18,13 @@ import os
 import time
 import sys
 import concurrent.futures
+import subprocess
+import platform
+from datetime import datetime, timezone
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from itertools import product
 from typing import Tuple, Optional
 from pathlib import Path
@@ -351,7 +357,12 @@ def _print_batch_progress(elapsed: float, games_completed: int, total_games: int
     else:
         print(f"\r{prefix}: {pct:5.1f}% | {rate:9,.0f} games/s | ETA: {eta_str}".ljust(80), end="", flush=True)
 
-def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None, quiet: bool = False) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def run_simulation_parallel(
+    total_count: int,
+    batch_size: Optional[int] = None,
+    quiet: bool = False,
+    base_seed: int = 0
+) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Runs Yatzy simulations in parallel using a streaming, constant-memory approach.
 
@@ -387,6 +398,7 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None, 
 
     start_time = time.time()
     max_in_flight = cpu_count * 2
+    batch_index = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_count) as executor:
         futures = set()
@@ -397,7 +409,8 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None, 
             # Submit new tasks only if there is capacity
             while sims_submitted < total_count and len(futures) < max_in_flight:
                 count = min(batch_size, total_count - sims_submitted)
-                seed = np.random.randint(0, 2**30)
+                seed = int(base_seed + batch_index)
+                batch_index += 1
                 futures.add(executor.submit(_worker_sim_batch, count, seed))
                 sims_submitted += count
 
@@ -434,6 +447,169 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None, 
         print() # Newline after loop
     return agg_total_score, agg_score_bins, agg_bins_ny_nb, agg_bins_ny_yb, agg_bins_yy_nb, agg_bins_yy_yb, aggregate_stats_roll1, aggregate_stats_roll2, aggregate_stats_roll3
 
+def _get_git_version() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return "unknown"
+
+def _run_command(cmd: list[str]) -> Optional[str]:
+    try:
+        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return None
+
+def _get_cpu_model() -> str:
+    if sys.platform == "win32":
+        output = _run_command(["wmic", "cpu", "get", "Name"])
+        if output:
+            lines = [line.strip() for line in output.splitlines() if line.strip()]
+            if len(lines) > 1:
+                return lines[1]
+    if os.path.exists("/proc/cpuinfo"):
+        try:
+            with open("/proc/cpuinfo", "r") as f:
+                for line in f:
+                    if "model name" in line:
+                        return line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+    return platform.processor() or "unknown"
+
+def _get_total_ram_gb() -> Optional[float]:
+    if sys.platform == "win32":
+        output = _run_command(["wmic", "computersystem", "get", "TotalPhysicalMemory"])
+        if output:
+            lines = [line.strip() for line in output.splitlines() if line.strip()]
+            if len(lines) > 1:
+                try:
+                    bytes_total = int(lines[1])
+                    return bytes_total / (1024 ** 3)
+                except ValueError:
+                    return None
+    if os.path.exists("/proc/meminfo"):
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        kb = int(line.split()[1])
+                        return kb / (1024 ** 2)
+        except Exception:
+            return None
+    sysconf = getattr(os, "sysconf", None)
+    if not sysconf:
+        return None
+    try:
+        pages = sysconf("SC_PHYS_PAGES")
+        page_size = sysconf("SC_PAGE_SIZE")
+        return (pages * page_size) / (1024 ** 3)
+    except Exception:
+        return None
+
+def _get_environment_snapshot() -> dict:
+    return {
+        "cpu_model": _get_cpu_model(),
+        "cpu_threads": os.cpu_count(),
+        "ram_gb": _get_total_ram_gb(),
+        "os_version": platform.platform()
+    }
+
+def _get_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _percentile_from_bins(bins: np.ndarray, pct: float) -> int:
+    total = int(bins.sum())
+    if total == 0:
+        return 0
+    target = pct * total
+    cumulative = 0
+    for score, count in enumerate(bins):
+        cumulative += int(count)
+        if cumulative >= target:
+            return score
+    return len(bins) - 1
+
+def _summary_from_bins(bins: np.ndarray) -> dict:
+    bins = np.asarray(bins, dtype=np.float64)
+    total = int(bins.sum())
+    if total == 0:
+        return {
+            "n": 0,
+            "mean_total": 0,
+            "sd_total": 0,
+            "se_total": 0,
+            "ci95_low": 0,
+            "ci95_high": 0,
+            "p05_total": 0,
+            "p50_total": 0,
+            "p95_total": 0
+        }
+    scores = np.arange(len(bins))
+    weighted = scores * bins
+    mean = float(weighted.sum() / total)
+    variance = float(((scores - mean) ** 2 * bins).sum() / max(total - 1, 1))
+    sd = variance ** 0.5
+    se = sd / (total ** 0.5)
+    ci95_low = mean - 1.96 * se
+    ci95_high = mean + 1.96 * se
+    return {
+        "n": total,
+        "mean_total": mean,
+        "sd_total": sd,
+        "se_total": se,
+        "ci95_low": ci95_low,
+        "ci95_high": ci95_high,
+        "p05_total": _percentile_from_bins(bins, 0.05),
+        "p50_total": _percentile_from_bins(bins, 0.50),
+        "p95_total": _percentile_from_bins(bins, 0.95)
+    }
+
+def _write_summary_csv(path: Path, summary: dict) -> None:
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "group", "n", "mean_total", "sd_total", "se_total", "ci95_low",
+            "ci95_high", "p05_total", "p50_total", "p95_total"
+        ])
+        for group, stats in summary.items():
+            w.writerow([
+                group,
+                stats["n"],
+                stats["mean_total"],
+                stats["sd_total"],
+                stats["se_total"],
+                stats["ci95_low"],
+                stats["ci95_high"],
+                stats["p05_total"],
+                stats["p50_total"],
+                stats["p95_total"]
+            ])
+
+def _plot_score_distribution(scores: np.ndarray, counts: np.ndarray, path: Path, title: str) -> None:
+    plt.figure(figsize=(12, 6))
+    plt.bar(scores, counts, width=1.0)
+    plt.xlabel("Score")
+    plt.ylabel("Count")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+def _plot_group_distributions(scores: np.ndarray, group_bins: dict, path: Path) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True, sharey=True)
+    axes = axes.flatten()
+    for ax, (name, bins) in zip(axes, group_bins.items()):
+        ax.bar(scores, bins, width=1.0)
+        ax.set_title(name)
+    for ax in axes[-2:]:
+        ax.set_xlabel("Score")
+    for ax in axes[::2]:
+        ax.set_ylabel("Count")
+    fig.suptitle("Score Distributions by Bonus/Yatzy Outcome")
+    fig.tight_layout(rect=(0, 0.03, 1, 0.95))
+    fig.savefig(path)
+    plt.close(fig)
+
 # --- MAIN EXECUTION ---
 
 def run_suite(args: argparse.Namespace) -> None:
@@ -449,12 +625,19 @@ def run_suite(args: argparse.Namespace) -> None:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
+    seed_scheme = "base_seed + worker_id"
+    environment = _get_environment_snapshot()
+    base_seed = args.seed
     
     # Mode 1: Distribution Analysis
     if args.n:
         print(f"\n=== MODE 1: DISTRIBUTION ANALYSIS ({args.n:,} sim) ===")
+        timestamp_start = _get_timestamp()
         start_t = time.time()
-        total_score, score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb, stats_roll1, stats_roll2, stats_roll3 = run_simulation_parallel(args.n)
+        total_score, score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb, stats_roll1, stats_roll2, stats_roll3 = run_simulation_parallel(
+            args.n,
+            base_seed=base_seed
+        )
         print("Simulations complete. Processing data...")
 
         with open(out_dir / f"dist_scores_{ts}.csv", "w", newline="") as f:
@@ -472,12 +655,56 @@ def run_suite(args: argparse.Namespace) -> None:
                 w.writerow([cat, stats_roll1[i], stats_roll1[i]/tot_r, stats_roll2[i], stats_roll2[i]/tot_r, stats_roll3[i], stats_roll3[i]/tot_r])
                 
         elapsed_tot = time.time() - start_t
+        timestamp_end = _get_timestamp()
+        games_per_second = args.n / elapsed_tot if elapsed_tot > 0 else 0
+        summary_total = _summary_from_bins(score_bins)
+        summary_groups = {
+            "NoYatzy_NoBonus": _summary_from_bins(bins_ny_nb),
+            "NoYatzy_YesBonus": _summary_from_bins(bins_ny_yb),
+            "YesYatzy_NoBonus": _summary_from_bins(bins_yy_nb),
+            "YesYatzy_YesBonus": _summary_from_bins(bins_yy_yb)
+        }
+        summary = {"Total": summary_total, **summary_groups}
+        group_bins = {
+            "NoYatzy_NoBonus": bins_ny_nb,
+            "NoYatzy_YesBonus": bins_ny_yb,
+            "YesYatzy_NoBonus": bins_yy_nb,
+            "YesYatzy_YesBonus": bins_yy_yb
+        }
+
+        _write_summary_csv(out_dir / f"dist_summary_{ts}.csv", summary)
+
+        _plot_score_distribution(
+            np.arange(SCORE_BINS_SIZE),
+            score_bins,
+            out_dir / f"dist_scores_{ts}.png",
+            f"Score Distribution (n={args.n:,})"
+        )
+        _plot_group_distributions(
+            np.arange(SCORE_BINS_SIZE),
+            group_bins,
+            out_dir / f"dist_groups_{ts}.png"
+        )
+
         meta = {
             "mode": "distribution",
-            "count": args.n,
-            "elapsed_sec": elapsed_tot,
-            "mean_score": total_score / args.n if args.n > 0 else 0,
-            "performance": f"{args.n/elapsed_tot:.0f} games/sec"
+            "code_version": _get_git_version(),
+            "python_version": sys.version,
+            "numpy_version": np.__version__,
+            "numba_version": __import__("numba").__version__,
+            "seed": base_seed,
+            "seed_scheme": seed_scheme,
+            "threads": os.cpu_count(),
+            "n_games": args.n,
+            "timestamp_start": timestamp_start,
+            "timestamp_end": timestamp_end,
+            "runtime_seconds": elapsed_tot,
+            "games_per_second": games_per_second,
+            "environment": environment,
+            "summary": {
+                "total": summary_total,
+                "groups": summary_groups
+            }
         }
         with open(out_dir / f"meta_dist_{ts}.json", "w") as f:
             json.dump(meta, f, indent=2)
@@ -488,13 +715,14 @@ def run_suite(args: argparse.Namespace) -> None:
         steps = [int(x) for x in args.study.split(",")]
         reps = args.reps
         print(f"\n=== MODE 2: DEVIATION STUDY ({len(steps)} steps, {reps} reps/step) ===")
-        _ = run_simulation_parallel(1, batch_size=1, quiet=True)
+        _ = run_simulation_parallel(1, batch_size=1, quiet=True, base_seed=base_seed)
         results = []
         summary_data = {cat: {step: [] for step in steps} for cat in CATEGORY_NAMES}
         timing_data = {step: [] for step in steps}
         
         total_games_in_study = sum(steps) * reps
         games_completed = 0
+        timestamp_start = _get_timestamp()
         start_t_study = time.time()
         
         for i_step, step in enumerate(steps):
@@ -502,7 +730,12 @@ def run_suite(args: argparse.Namespace) -> None:
                 print(f"\nRunning Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...")
                 step_start_time = time.time()
                 study_batch_size = min(100_000, max(1000, step//(os.cpu_count() or 4)))
-                _, _, _, _, _, _, stats_roll1, _, _ = run_simulation_parallel(step, batch_size=study_batch_size)
+                study_seed = base_seed + i_step * reps + r
+                _, _, _, _, _, _, stats_roll1, _, _ = run_simulation_parallel(
+                    step,
+                    batch_size=study_batch_size,
+                    base_seed=study_seed
+                )
                 step_elapsed = time.time() - step_start_time
                 timing_data[step].append(step_elapsed)
                 
@@ -545,11 +778,27 @@ def run_suite(args: argparse.Namespace) -> None:
                     row.append(f"{avg_dev:.4g}")
                 w.writerow(row)
 
+        elapsed_study = time.time() - start_t_study
+        timestamp_end = _get_timestamp()
+        total_games = total_games_in_study
+        games_per_second = total_games / elapsed_study if elapsed_study > 0 else 0
         meta_study = {
             "mode": "deviation_study",
+            "code_version": _get_git_version(),
+            "python_version": sys.version,
+            "numpy_version": np.__version__,
+            "numba_version": __import__("numba").__version__,
+            "seed": base_seed,
+            "seed_scheme": seed_scheme,
+            "threads": os.cpu_count(),
+            "n_games": total_games,
+            "timestamp_start": timestamp_start,
+            "timestamp_end": timestamp_end,
+            "runtime_seconds": elapsed_study,
+            "games_per_second": games_per_second,
+            "environment": environment,
             "steps": steps,
             "reps": reps,
-            "elapsed_sec": time.time() - start_t_study,
             "timing_stats": {
                 str(step): {
                     "avg_sec": sum(timing_data[step]) / len(timing_data[step]),
@@ -569,6 +818,7 @@ if __name__ == "__main__":
     parser.add_argument("--study", type=str, help="Comma-separated list of simulation steps")
     parser.add_argument("--reps", type=int, default=5, help="Repetitions per step in study mode")
     parser.add_argument("--output", type=str, default="results", help="Output directory")
+    parser.add_argument("--seed", type=int, default=12345, help="Base seed for deterministic runs")
 
     args = parser.parse_args()
     
