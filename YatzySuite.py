@@ -461,11 +461,10 @@ def _run_command(cmd: list[str]) -> Optional[str]:
 
 def _get_cpu_model() -> str:
     if sys.platform == "win32":
-        output = _run_command(["wmic", "cpu", "get", "Name"])
+        output = _run_command(["powershell.exe", "-Command", "Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name"])
         if output:
-            lines = [line.strip() for line in output.splitlines() if line.strip()]
-            if len(lines) > 1:
-                return lines[1]
+            cpu_name = output.strip()
+            return cpu_name
     if os.path.exists("/proc/cpuinfo"):
         try:
             with open("/proc/cpuinfo", "r") as f:
@@ -478,15 +477,13 @@ def _get_cpu_model() -> str:
 
 def _get_total_ram_gb() -> Optional[float]:
     if sys.platform == "win32":
-        output = _run_command(["wmic", "computersystem", "get", "TotalPhysicalMemory"])
+        output = _run_command(["powershell.exe", "-Command", "Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty TotalPhysicalMemory"])
         if output:
-            lines = [line.strip() for line in output.splitlines() if line.strip()]
-            if len(lines) > 1:
-                try:
-                    bytes_total = int(lines[1])
-                    return bytes_total / (1024 ** 3)
-                except ValueError:
-                    return None
+            try:
+                bytes_total = int(output.strip())
+                return bytes_total / (1024 ** 3)
+            except ValueError:
+                return None
     if os.path.exists("/proc/meminfo"):
         try:
             with open("/proc/meminfo", "r") as f:
@@ -777,6 +774,31 @@ def run_suite(args: argparse.Namespace) -> None:
                     avg_dev = sum(devs) / len(devs) if devs else 0
                     row.append(f"{avg_dev:.4g}")
                 w.writerow(row)
+
+        # Generate deviation plot
+        print("Generating deviation plot...")
+        plt.figure(figsize=(12, 8))
+        for cat in CATEGORY_NAMES:
+            if cat == "Chance":
+                continue  # Skip Chance as it's all zeros
+            deviations = []
+            for step in steps:
+                devs = summary_data[cat][step]
+                avg_dev = sum(devs) / len(devs) if devs else 0
+                deviations.append(avg_dev)
+            plt.plot(steps, deviations, marker='o', label=cat)
+
+        plt.xscale('log')
+        plt.xlabel('Simulation Size')
+        plt.ylabel('Average Deviation (%)')
+        plt.yscale('log')
+        plt.title('Deviation Between Expected and Observed Probabilities vs Simulation Size')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+        plt.tight_layout()
+        plt.savefig(out_dir / f"study_deviation_plot_{ts}.png", dpi=300, bbox_inches='tight')
+        plt.close()  # Close the figure to free memory
+        print(f"Plot saved as {out_dir}/study_deviation_plot_{ts}.png")
 
         elapsed_study = time.time() - start_t_study
         timestamp_end = _get_timestamp()
