@@ -38,7 +38,7 @@ DICE_FACES = 6
 ROLL_STATE_COUNT = DICE_FACES ** DICE_COUNT
 MAX_SCORE = 374
 SCORE_BINS_SIZE = MAX_SCORE + 1
-YATZY_INDEX = 9 # "Yatzy" is ninth in the CATEGORY_NAMES array.
+YATZY_INDEX = 9 # "Yatzy" is tenth in the CATEGORY_NAMES array.
 
 # Exact probabilities based on 7776 possible outcomes (6^5)
 EXPECTED_PROBS = np.array([
@@ -84,16 +84,16 @@ def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarr
     # In case of tie, prefer earlier entries in this array
     # IDs correspond to the order in which they were named in CATEGORY_NAMES
     priority = np.array([
-        5,  # Sixes
-        4,  # Fives
-        3,  # Fours
-        2,  # Threes
-        1,  # Twos
-        0,  # Aces
+        0,  # Ettor
+        1,  # Tvåor
+        2,  # Treor
+        3,  # Fyror
+        4,  # Femmor
+        5,  # Sexor
+        6,  # Ett par
+        7,  # Tretal
+        8,  # Fyrtal
         9,  # Yatzy
-        8,  # Four of a Kind
-        7,  # Three of a Kind
-        6,  # One Pair
         10, # Two Pairs
         11, # Small Straight
         12, # Large Straight
@@ -423,7 +423,6 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None, 
                     print(f"Simulation halted due to an exception in a worker thread: {e}")
                     traceback.print_exc()
                     print("--- END OF ERROR REPORT ---")
-                    # We must re-raise to stop the program
                     raise e
 
             elapsed = time.time() - start_time
@@ -431,7 +430,7 @@ def run_simulation_parallel(total_count: int, batch_size: Optional[int] = None, 
                 _print_batch_progress(elapsed, sims_completed, total_count, "Simulating")
 
     if not quiet:
-        print() # Newline after loop
+        print()
     return agg_total_score, agg_score_bins, agg_bins_ny_nb, agg_bins_ny_yb, agg_bins_yy_nb, agg_bins_yy_yb, aggregate_stats_roll1, aggregate_stats_roll2, aggregate_stats_roll3
 
 # --- MAIN EXECUTION ---
