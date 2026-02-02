@@ -474,9 +474,12 @@ def _get_total_ram_gb() -> Optional[float]:
                         return kb / (1024 ** 2)
         except Exception:
             return None
+    sysconf = getattr(os, "sysconf", None)
+    if not sysconf:
+        return None
     try:
-        pages = os.sysconf("SC_PHYS_PAGES")
-        page_size = os.sysconf("SC_PAGE_SIZE")
+        pages = sysconf("SC_PHYS_PAGES")
+        page_size = sysconf("SC_PAGE_SIZE")
         return (pages * page_size) / (1024 ** 3)
     except Exception:
         return None
@@ -581,7 +584,7 @@ def _plot_group_distributions(scores: np.ndarray, group_bins: dict, path: Path) 
     for ax in axes[::2]:
         ax.set_ylabel("Count")
     fig.suptitle("Score Distributions by Bonus/Yatzy Outcome")
-    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.tight_layout(rect=(0, 0.03, 1, 0.95))
     fig.savefig(path)
     plt.close(fig)
 
