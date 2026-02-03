@@ -361,7 +361,8 @@ def run_simulation_parallel(
     total_count: int,
     batch_size: Optional[int] = None,
     quiet: bool = False,
-    base_seed: int = 0
+    base_seed: int = 0,
+    threads: Optional[int] = None
 ) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Runs Yatzy simulations in parallel using a streaming, constant-memory approach.
@@ -379,7 +380,7 @@ def run_simulation_parallel(
     Returns:
         tuple: Final aggregated results from all workers.
     """    
-    cpu_count = os.cpu_count() or 4
+    cpu_count = threads if threads is not None else (os.cpu_count() or 4)
     if batch_size is None:
         target_chunks = cpu_count * 4
         batch_size = max(1000, total_count // target_chunks)
@@ -665,15 +666,28 @@ def run_suite(args: argparse.Namespace) -> None:
     seed_scheme = "base_seed + worker_id"
     environment = _get_environment_snapshot()
     base_seed = args.seed
-    
+
+    # Determine effective threads and (later) batch_size for logging and usage
+    effective_threads = args.threads or (os.cpu_count() or 4)
+
     # Mode 1: Distribution Analysis
     if args.n:
         print(f"\n=== MODE 1: DISTRIBUTION ANALYSIS ({args.n:,} sim) ===")
         timestamp_start = _get_timestamp()
         start_t = time.time()
+        # Compute effective batch size (unless user specified --batch-size)
+        if args.batch_size:
+            effective_batch_size = args.batch_size
+        else:
+            target_chunks = effective_threads * 4
+            effective_batch_size = max(1000, args.n // target_chunks)
+            effective_batch_size = min(effective_batch_size, 100_000)
+
         total_score, score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb, stats_roll1, stats_roll2, stats_roll3 = run_simulation_parallel(
             args.n,
-            base_seed=base_seed
+            batch_size=effective_batch_size,
+            base_seed=base_seed,
+            threads=effective_threads
         )
         print("Simulations complete. Processing data...")
 
@@ -736,7 +750,8 @@ def run_suite(args: argparse.Namespace) -> None:
             "numba_version": __import__("numba").__version__,
             "seed": base_seed,
             "seed_scheme": seed_scheme,
-            "threads": os.cpu_count(),
+            "threads": effective_threads,
+            "batch_size": effective_batch_size,
             "n_games": args.n,
             "timestamp_start": timestamp_start,
             "timestamp_end": timestamp_end,
@@ -754,37 +769,39 @@ def run_suite(args: argparse.Namespace) -> None:
 
     # Mode 2: Probability Deviation Study
     if args.study:
+        # reuse effective_threads computed earlier
         steps = [int(x) for x in args.study.split(",")]
         reps = args.reps
         print(f"\n=== MODE 2: DEVIATION STUDY ({len(steps)} steps, {reps} reps/step) ===")
-        _ = run_simulation_parallel(1, batch_size=1, quiet=True, base_seed=base_seed)
+        _ = run_simulation_parallel(1, batch_size=1, quiet=True, base_seed=base_seed, threads=effective_threads)
         results = []
         summary_data = {cat: {step: [] for step in steps} for cat in CATEGORY_NAMES}
         timing_data = {step: [] for step in steps}
-        
+
         total_games_in_study = sum(steps) * reps
         games_completed = 0
         timestamp_start = _get_timestamp()
         start_t_study = time.time()
-        
+
         for i_step, step in enumerate(steps):
             for r in range(reps):
                 print(f"\nRunning Step {i_step+1}/{len(steps)} (size: {step:,}), Rep {r+1}/{reps}...")
                 step_start_time = time.time()
-                study_batch_size = min(100_000, max(1000, step//(os.cpu_count() or 4)))
+                study_batch_size = min(100_000, max(1000, step//effective_threads))
                 study_seed = base_seed + i_step * reps + r
                 _, _, _, _, _, _, stats_roll1, _, _ = run_simulation_parallel(
                     step,
                     batch_size=study_batch_size,
-                    base_seed=study_seed
+                    base_seed=study_seed,
+                    threads=effective_threads
                 )
                 step_elapsed = time.time() - step_start_time
                 timing_data[step].append(step_elapsed)
-                
+
                 games_completed += step
                 total_rolls = step * NUM_CATEGORIES
                 obs_probs = stats_roll1 / total_rolls
-                abs_devs = np.abs(obs_probs - EXPECTED_PROBS) * 100 
+                abs_devs = np.abs(obs_probs - EXPECTED_PROBS) * 100
                 
                 for i, cat in enumerate(CATEGORY_NAMES):
                     dev_val = abs_devs[i]
@@ -857,7 +874,8 @@ def run_suite(args: argparse.Namespace) -> None:
             "numba_version": __import__("numba").__version__,
             "seed": base_seed,
             "seed_scheme": seed_scheme,
-            "threads": os.cpu_count(),
+            "threads": effective_threads,
+            "batch_size": args.batch_size if args.batch_size else None,
             "n_games": total_games,
             "timestamp_start": timestamp_start,
             "timestamp_end": timestamp_end,
@@ -886,6 +904,8 @@ if __name__ == "__main__":
     parser.add_argument("--reps", type=int, default=5, help="Repetitions per step in study mode")
     parser.add_argument("--output", type=str, default="results", help="Output directory")
     parser.add_argument("--seed", type=int, default=12345, help="Base seed for deterministic runs")
+    parser.add_argument("--threads", type=int, help="Number of worker threads (defaults to CPU count)")
+    parser.add_argument("--batch-size", type=int, dest="batch_size", help="Batch size per worker (overrides automatic selection)")
 
     args = parser.parse_args()
     
