@@ -20,6 +20,7 @@ import sys
 import concurrent.futures
 import subprocess
 import platform
+import random
 from datetime import datetime, timezone
 import numpy as np
 import matplotlib
@@ -665,7 +666,12 @@ def run_suite(args: argparse.Namespace) -> None:
     ts = int(time.time())
     seed_scheme = "base_seed + worker_id"
     environment = _get_environment_snapshot()
-    base_seed = args.seed
+    # If user omitted --seed, choose a random base seed for nondeterministic runs
+    if args.seed is None:
+        base_seed = random.randrange(2**31)
+        print(f"Using random base seed: {base_seed}")
+    else:
+        base_seed = args.seed
 
     # Determine effective threads and (later) batch_size for logging and usage
     effective_threads = args.threads or (os.cpu_count() or 4)
@@ -903,7 +909,7 @@ if __name__ == "__main__":
     parser.add_argument("--study", type=str, help="Comma-separated list of simulation steps")
     parser.add_argument("--reps", type=int, default=5, help="Repetitions per step in study mode")
     parser.add_argument("--output", type=str, default="results", help="Output directory")
-    parser.add_argument("--seed", type=int, default=12345, help="Base seed for deterministic runs")
+    parser.add_argument("--seed", type=int, default=None, help="Base seed for deterministic runs (if omitted a random seed is chosen)")
     parser.add_argument("--threads", type=int, help="Number of worker threads (defaults to CPU count)")
     parser.add_argument("--batch-size", type=int, dest="batch_size", help="Batch size per worker (overrides automatic selection)")
 
