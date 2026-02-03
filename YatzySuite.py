@@ -606,6 +606,47 @@ def _plot_group_distributions(scores: np.ndarray, group_bins: dict, path: Path) 
     fig.savefig(path)
     plt.close(fig)
 
+
+def _plot_category_likelihoods(stats_roll1: np.ndarray, stats_roll2: np.ndarray, stats_roll3: np.ndarray, out_dir: Path, ts: int) -> None:
+    """
+    Create bar charts showing the percentage chance to achieve each category
+    on roll 1, roll 2 and roll 3. Produces three separate PNG files for the
+    requested groupings: Upper (Aces-Sixes), N-of-a-kind + Yatzy, and
+    Pairs/Straights/Full House.
+    """
+    total_rolls = int((stats_roll1.sum()))  # this is total rolls for roll1 (should equal n*15)
+    # Avoid division by zero
+    if total_rolls == 0:
+        return
+
+    probs1 = stats_roll1 / total_rolls * 100.0
+    probs2 = stats_roll2 / total_rolls * 100.0
+    probs3 = stats_roll3 / total_rolls * 100.0
+
+    groups = [
+        (list(range(0, 6)), "Upper Section (Aces-Sixes)", f"dist_categories_upper_{ts}.png"),
+        ([6,7,8,9], "Pair/Kind/Yatzy", f"dist_categories_kinds_{ts}.png"),
+        ([10,11,12,13], "Pairs/Straights/Full House", f"dist_categories_others_{ts}.png")
+    ]
+
+    for indices, title, fname in groups:
+        labels = [CATEGORY_NAMES[i] for i in indices]
+        x = np.arange(len(indices))
+        width = 0.25
+
+        plt.figure(figsize=(10, 5))
+        plt.bar(x - width, probs1[indices], width=width, label='Roll 1', color='#4C72B0')
+        plt.bar(x,         probs2[indices], width=width, label='Roll 2', color='#55A868')
+        plt.bar(x + width, probs3[indices], width=width, label='Roll 3', color='#C44E52')
+
+        plt.xticks(x, labels, rotation=20, ha='right')
+        plt.ylabel('Percentage Chance (%)')
+        plt.title(f"Likelihood to Achieve Categories — {title}")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_dir / fname, dpi=200)
+        plt.close()
+
 # --- MAIN EXECUTION ---
 
 def run_suite(args: argparse.Namespace) -> None:
@@ -649,6 +690,11 @@ def run_suite(args: argparse.Namespace) -> None:
             w.writerow(["Category", "Roll1_Hits", "Roll1_Prob", "Roll2_Hits", "Roll2_Prob", "Roll3_Hits", "Roll3_Prob"])
             for i, cat in enumerate(CATEGORY_NAMES):
                 w.writerow([cat, stats_roll1[i], stats_roll1[i]/tot_r, stats_roll2[i], stats_roll2[i]/tot_r, stats_roll3[i], stats_roll3[i]/tot_r])
+        # Create bar charts showing percentage chance per category for each roll
+        try:
+            _plot_category_likelihoods(stats_roll1, stats_roll2, stats_roll3, out_dir, ts)
+        except Exception:
+            print("Warning: failed to create category likelihood plots")
                 
         elapsed_tot = time.time() - start_t
         timestamp_end = _get_timestamp()
