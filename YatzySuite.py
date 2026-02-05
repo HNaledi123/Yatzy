@@ -357,14 +357,14 @@ def run_simulation_parallel(
 
     # Global aggregates
     agg_total_score = 0
-    agg_score_bins = np.zeros(SCORE_BINS_SIZE, dtype=np.uint64)
-    agg_bins_ny_nb = np.zeros(SCORE_BINS_SIZE, dtype=np.uint64)
-    agg_bins_ny_yb = np.zeros(SCORE_BINS_SIZE, dtype=np.uint64)
-    agg_bins_yy_nb = np.zeros(SCORE_BINS_SIZE, dtype=np.uint64)
-    agg_bins_yy_yb = np.zeros(SCORE_BINS_SIZE, dtype=np.uint64)
-    aggregate_stats_roll1 = np.zeros(NUM_CATEGORIES, dtype=np.uint64)
-    aggregate_stats_roll2 = np.zeros(NUM_CATEGORIES, dtype=np.uint64)
-    aggregate_stats_roll3 = np.zeros(NUM_CATEGORIES, dtype=np.uint64)
+    agg_score_bins = np.zeros(SCORE_BINS_SIZE, dtype=object)
+    agg_bins_ny_nb = np.zeros(SCORE_BINS_SIZE, dtype=object)
+    agg_bins_ny_yb = np.zeros(SCORE_BINS_SIZE, dtype=object)
+    agg_bins_yy_nb = np.zeros(SCORE_BINS_SIZE, dtype=object)
+    agg_bins_yy_yb = np.zeros(SCORE_BINS_SIZE, dtype=object)
+    aggregate_stats_roll1 = np.zeros(NUM_CATEGORIES, dtype=object)
+    aggregate_stats_roll2 = np.zeros(NUM_CATEGORIES, dtype=object)
+    aggregate_stats_roll3 = np.zeros(NUM_CATEGORIES, dtype=object)
 
     start_time = time.time()
     max_in_flight = cpu_count * 2
