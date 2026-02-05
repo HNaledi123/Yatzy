@@ -47,25 +47,6 @@ MAX_SCORE = 374
 SCORE_BINS_SIZE = MAX_SCORE + 1
 YATZY_INDEX = 9 # "Yatzy" is tenth in the CATEGORY_NAMES array.
 
-# Exact probabilities based on 7776 possible outcomes (6^5)
-EXPECTED_PROBS = np.array([
-    4651 / ROLL_STATE_COUNT,    # Ettor
-    4651 / ROLL_STATE_COUNT,    # Tvåor
-    4651 / ROLL_STATE_COUNT,    # Treor
-    4651 / ROLL_STATE_COUNT,    # Fyror
-    4651 / ROLL_STATE_COUNT,    # Femmor
-    4651 / ROLL_STATE_COUNT,    # Sexor
-    7056 / ROLL_STATE_COUNT,    # Ett par
-    1656 / ROLL_STATE_COUNT,    # Tretal
-    156  / ROLL_STATE_COUNT,    # Fyrtal
-    6    / ROLL_STATE_COUNT,    # Yatzy
-    2100 / ROLL_STATE_COUNT,    # Två par
-    120  / ROLL_STATE_COUNT,    # Liten stege
-    120  / ROLL_STATE_COUNT,    # Stor stege
-    300  / ROLL_STATE_COUNT,    # Kåk
-    1.0                         # Chans
-])
-
 # --- LOOKUP TABLE GENERATION ---
 
 def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -77,80 +58,62 @@ def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarr
     - satisfaction_mask: A boolean mask indicating if a category is achieved (satisifed).
     - keep_value: The face value of the dice to keep for the re-roll strategy.
     - keep_count: The count of dice to keep for the re-roll strategy.
-    - priority: An array defining the preferred order for choosing categories.
+    - expected_probs: Exact per-category satisfaction probabilities on a single roll
+                      (uniform over 6^5 outcomes), derived from satisfaction_mask.
 
     Returns:
-        tuple: A tuple containing the generated np arrays:
-               (scores, satisfaction_mask, keep_value, keep_count, priority).
+        tuple: (scores, satisfaction_mask, keep_value, keep_count, expected_probs)
     """
     scores = np.zeros((ROLL_STATE_COUNT, NUM_CATEGORIES), dtype=np.int16)
     satisfaction_mask = np.zeros((ROLL_STATE_COUNT, NUM_CATEGORIES), dtype=np.uint8)
     keep_value = np.zeros(ROLL_STATE_COUNT, dtype=np.int8)
     keep_count = np.zeros(ROLL_STATE_COUNT, dtype=np.int8)
-
-    # In case of tie, prefer earlier entries in this array
-    # IDs correspond to the order in which they were named in CATEGORY_NAMES
-    priority = np.array([
-        0,  # Ettor
-        1,  # Tvåor
-        2,  # Treor
-        3,  # Fyror
-        4,  # Femmor
-        5,  # Sexor
-        6,  # Ett par
-        7,  # Tretal
-        8,  # Fyrtal
-        9,  # Yatzy
-        10, # Two Pairs
-        11, # Small Straight
-        12, # Large Straight
-        13, # Full House
-        14  # Chance
-    ], dtype=np.int8)
+    sat_hits = np.zeros(NUM_CATEGORIES, dtype=np.uint32)
 
     for index, dice in enumerate(product(range(1, DICE_FACES + 1), repeat=DICE_COUNT)):
         dice_array = np.array(dice, dtype=np.int8)
-        counts = np.bincount(dice_array, minlength=7) # Counts[0] unused
+        counts = np.bincount(dice_array, minlength=7)  # Counts[0] unused
 
         # Upper Section (Ettor-Sexor)
         for face in range(1, 7):
-            scores[index, face-1] = counts[face] * face
-            if counts[face] > 0: satisfaction_mask[index, face-1] = 1
-        
-        # N of a Kind (2-5)
+            scores[index, face - 1] = counts[face] * face
+            if counts[face] > 0:
+                satisfaction_mask[index, face - 1] = 1
+
+        # N of a Kind (2-5) => indices: 6..9 (Ett par, Tretal, Fyrtal, Yatzy)
         for count in range(2, 6):
             if count == 5:
                 if np.any(counts[1:] >= 5):
-                    scores[index, count+4] = 50
-                    satisfaction_mask[index, count+4] = 1
+                    scores[index, count + 4] = 50
+                    satisfaction_mask[index, count + 4] = 1
             else:
                 for face in range(6, 0, -1):
                     if counts[face] >= count:
-                        scores[index, count+4] = face * count
-                        satisfaction_mask[index, count+4] = 1
+                        scores[index, count + 4] = face * count
+                        satisfaction_mask[index, count + 4] = 1
                         break
-        
-        # Two Pairs
+
+        # Two Pairs (index 10)
         pairs = [face for face in range(1, 7) if counts[face] >= 2]
         if len(pairs) >= 2:
-            scores[index, 10] = pairs[-1]*2 + pairs[-2]*2
+            scores[index, 10] = pairs[-1] * 2 + pairs[-2] * 2
             satisfaction_mask[index, 10] = 1
-            
-        # Straights
+
+        # Straights (indices 11, 12)
         unique_values = np.unique(dice_array)
-        if np.array_equal(unique_values, [1,2,3,4,5]): 
+        if np.array_equal(unique_values, [1, 2, 3, 4, 5]):
             scores[index, 11] = 15
             satisfaction_mask[index, 11] = 1
-        if np.array_equal(unique_values, [2,3,4,5,6]): 
+        if np.array_equal(unique_values, [2, 3, 4, 5, 6]):
             scores[index, 12] = 20
             satisfaction_mask[index, 12] = 1
-            
-        # Full House
+
+        # Full House (index 13)
         if np.any(counts == 3) and np.any(counts == 2):
-            scores[index, 13] = (np.where(counts==3)[0][0]*3 + np.where(counts==2)[0][0]*2)
+            scores[index, 13] = (np.where(counts == 3)[0][0] * 3 + np.where(counts == 2)[0][0] * 2)
             satisfaction_mask[index, 13] = 1
 
-        # Chance
+        # Chance (index 14)
         scores[index, 14] = dice_array.sum()
         satisfaction_mask[index, 14] = 1
 
@@ -159,10 +122,16 @@ def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarr
         keep_value[index] = max(face for face in range(1, 7) if counts[face] == max_count)
         keep_count[index] = max_count
 
-    return scores, satisfaction_mask, keep_value, keep_count, priority
+        # Accumulate satisfied-category counts (exact expected probabilities on a single roll)
+        sat_hits += satisfaction_mask[index]
+
+    expected_probs = sat_hits.astype(np.float64) / float(ROLL_STATE_COUNT)
+
+    return scores, satisfaction_mask, keep_value, keep_count, expected_probs
+
 
 print("Building lookup tables...", end="", flush=True)
-LOOKUP_SCORES, LOOKUP_SATISFACTION_MASK, LOOKUP_KEEP_VALUE, LOOKUP_KEEP_COUNT, LOOKUP_PRIORITY = _build_lookup_tables()
+LOOKUP_SCORES, LOOKUP_SATISFACTION_MASK, LOOKUP_KEEP_VALUE, LOOKUP_KEEP_COUNT, EXPECTED_PROBS = _build_lookup_tables()
 print(" Done.")
 
 # --- NUMBA FUNCTIONS ---
@@ -257,8 +226,7 @@ def _play_game(stats0: np.ndarray, stats1: np.ndarray, stats2: np.ndarray, d0: n
         best_id = -1
         scores = LOOKUP_SCORES[index2]
         
-        for i in range(NUM_CATEGORIES):
-            cat = LOOKUP_PRIORITY[i]
+        for cat in range(NUM_CATEGORIES):
             if (allowed_categories >> cat) & 1:
                 s = scores[cat]
                 if s > best_sc:
@@ -389,14 +357,14 @@ def run_simulation_parallel(
 
     # Global aggregates
     agg_total_score = 0
-    agg_score_bins = np.zeros(SCORE_BINS_SIZE, dtype=object)
-    agg_bins_ny_nb = np.zeros(SCORE_BINS_SIZE, dtype=object)
-    agg_bins_ny_yb = np.zeros(SCORE_BINS_SIZE, dtype=object)
-    agg_bins_yy_nb = np.zeros(SCORE_BINS_SIZE, dtype=object)
-    agg_bins_yy_yb = np.zeros(SCORE_BINS_SIZE, dtype=object)
-    aggregate_stats_roll1 = np.zeros(NUM_CATEGORIES, dtype=object)
-    aggregate_stats_roll2 = np.zeros(NUM_CATEGORIES, dtype=object)
-    aggregate_stats_roll3 = np.zeros(NUM_CATEGORIES, dtype=object)
+    agg_score_bins = np.zeros(SCORE_BINS_SIZE, dtype=np.uint64)
+    agg_bins_ny_nb = np.zeros(SCORE_BINS_SIZE, dtype=np.uint64)
+    agg_bins_ny_yb = np.zeros(SCORE_BINS_SIZE, dtype=np.uint64)
+    agg_bins_yy_nb = np.zeros(SCORE_BINS_SIZE, dtype=np.uint64)
+    agg_bins_yy_yb = np.zeros(SCORE_BINS_SIZE, dtype=np.uint64)
+    aggregate_stats_roll1 = np.zeros(NUM_CATEGORIES, dtype=np.uint64)
+    aggregate_stats_roll2 = np.zeros(NUM_CATEGORIES, dtype=np.uint64)
+    aggregate_stats_roll3 = np.zeros(NUM_CATEGORIES, dtype=np.uint64)
 
     start_time = time.time()
     max_in_flight = cpu_count * 2
@@ -608,14 +576,14 @@ def _plot_group_distributions(scores: np.ndarray, group_bins: dict, path: Path) 
     plt.close(fig)
 
 
-def _plot_category_likelihoods(stats_roll1: np.ndarray, stats_roll2: np.ndarray, stats_roll3: np.ndarray, out_dir: Path, ts: int) -> None:
+def _plot_category_likelihoods(stats_roll1: np.ndarray, stats_roll2: np.ndarray, stats_roll3: np.ndarray, out_dir: Path, ts: int, n_games: int) -> None:
     """
     Create bar charts showing the percentage chance to achieve each category
     on roll 1, roll 2 and roll 3. Produces three separate PNG files for the
     requested groupings: Upper (Ettor-Sexor), N-of-a-kind + Yatzy, and
     Pairs/Straights/Full House.
     """
-    total_rolls = int((stats_roll1.sum()))
+    total_rolls = int(n_games * NUM_CATEGORIES)
     if total_rolls == 0:
         return
 
@@ -682,7 +650,7 @@ def run_suite(args: argparse.Namespace) -> None:
         else:
             target_chunks = effective_threads * 4
             effective_batch_size = max(1000, args.n // target_chunks)
-            effective_batch_size = min(effective_batch_size, 1_000_000)
+            effective_batch_size = min(effective_batch_size, 100_000)
 
         total_score, score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb, stats_roll1, stats_roll2, stats_roll3 = run_simulation_parallel(
             args.n,
@@ -706,7 +674,7 @@ def run_suite(args: argparse.Namespace) -> None:
             for i, cat in enumerate(CATEGORY_NAMES):
                 w.writerow([cat, stats_roll1[i], stats_roll1[i]/tot_r, stats_roll2[i], stats_roll2[i]/tot_r, stats_roll3[i], stats_roll3[i]/tot_r])
         try:
-            _plot_category_likelihoods(stats_roll1, stats_roll2, stats_roll3, out_dir, ts)
+            _plot_category_likelihoods(stats_roll1, stats_roll2, stats_roll3, out_dir, ts, args.n)
         except Exception:
             print("Warning: failed to create category likelihood plots")
                 
