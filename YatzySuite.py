@@ -34,9 +34,9 @@ from numba import njit
 # --- CONFIGURATION & CONSTANTS ---
 
 CATEGORY_NAMES = [
-    "Aces", "Twos", "Threes", "Fours", "Fives", "Sixes",
-    "One Pair", "Three of a Kind", "Four of a Kind", "Yatzy",
-    "Two Pairs", "Small Straight", "Large Straight", "Full House", "Chance"
+    "Ettor", "Tvåor", "Treor", "Fyror", "Femmor", "Sexor",
+    "Ett Par", "Tretal", "Fyrtal", "Yatzy",
+    "Två Par", "Liten Stege", "Stor Stege", "Kåk", "Chans"
 ]
 
 NUM_CATEGORIES = 15
@@ -49,12 +49,12 @@ YATZY_INDEX = 9 # "Yatzy" is tenth in the CATEGORY_NAMES array.
 
 # Exact probabilities based on 7776 possible outcomes (6^5)
 EXPECTED_PROBS = np.array([
-    4651 / ROLL_STATE_COUNT,    # Aces
-    4651 / ROLL_STATE_COUNT,    # Twos
-    4651 / ROLL_STATE_COUNT,    # Threes
-    4651 / ROLL_STATE_COUNT,    # Fours
-    4651 / ROLL_STATE_COUNT,    # Fives
-    4651 / ROLL_STATE_COUNT,    # Sixes
+    4651 / ROLL_STATE_COUNT,    # Ettor
+    4651 / ROLL_STATE_COUNT,    # Tvåor
+    4651 / ROLL_STATE_COUNT,    # Treor
+    4651 / ROLL_STATE_COUNT,    # Fyror
+    4651 / ROLL_STATE_COUNT,    # Femmor
+    4651 / ROLL_STATE_COUNT,    # Sexor
     7056 / ROLL_STATE_COUNT,    # One Pair
     1656 / ROLL_STATE_COUNT,    # Three of a Kind
     156  / ROLL_STATE_COUNT,    # Four of a Kind
@@ -112,7 +112,7 @@ def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarr
         dice_array = np.array(dice, dtype=np.int8)
         counts = np.bincount(dice_array, minlength=7) # Counts[0] unused
 
-        # Upper Section (Aces through Sixes)
+        # Upper Section (Ettor through Sexor)
         for face in range(1, 7):
             scores[index, face-1] = counts[face] * face
             if counts[face] > 0: satisfaction_mask[index, face-1] = 1
@@ -586,8 +586,8 @@ def _write_summary_csv(path: Path, summary: dict) -> None:
 def _plot_score_distribution(scores: np.ndarray, counts: np.ndarray, path: Path, title: str) -> None:
     plt.figure(figsize=(12, 6))
     plt.bar(scores, counts, width=1.0)
-    plt.xlabel("Score")
-    plt.ylabel("Count")
+    plt.xlabel("Poäng")
+    plt.ylabel("Antal spel")
     plt.title(title)
     plt.tight_layout()
     plt.savefig(path)
@@ -600,10 +600,10 @@ def _plot_group_distributions(scores: np.ndarray, group_bins: dict, path: Path) 
         ax.bar(scores, bins, width=1.0)
         ax.set_title(name)
     for ax in axes[-2:]:
-        ax.set_xlabel("Score")
+        ax.set_xlabel("Poäng")
     for ax in axes[::2]:
-        ax.set_ylabel("Count")
-    fig.suptitle("Score Distributions by Bonus/Yatzy Outcome")
+        ax.set_ylabel("Antal spel")
+    fig.suptitle("Poängfördelning utifrån Bonus/Yatzy-utfall")
     fig.tight_layout(rect=(0, 0.03, 1, 0.95))
     fig.savefig(path)
     plt.close(fig)
@@ -613,7 +613,7 @@ def _plot_category_likelihoods(stats_roll1: np.ndarray, stats_roll2: np.ndarray,
     """
     Create bar charts showing the percentage chance to achieve each category
     on roll 1, roll 2 and roll 3. Produces three separate PNG files for the
-    requested groupings: Upper (Aces-Sixes), N-of-a-kind + Yatzy, and
+    requested groupings: Upper (Ettor-Sexor), N-of-a-kind + Yatzy, and
     Pairs/Straights/Full House.
     """
     total_rolls = int((stats_roll1.sum()))  # this is total rolls for roll1 (should equal n*15)
@@ -626,9 +626,9 @@ def _plot_category_likelihoods(stats_roll1: np.ndarray, stats_roll2: np.ndarray,
     probs3 = stats_roll3 / total_rolls * 100.0
 
     groups = [
-        (list(range(0, 6)), "Upper Section (Aces-Sixes)", f"dist_categories_upper_{ts}.png"),
-        ([6,7,8,9], "Pair/Kind/Yatzy", f"dist_categories_kinds_{ts}.png"),
-        ([10,11,12,13], "Pairs/Straights/Full House", f"dist_categories_others_{ts}.png")
+        (list(range(0, 6)), "Övre sektion (Ettor-Sexor)", f"dist_categories_upper_{ts}.png"),
+        ([6,7,8,9], "Par/Tretal/Fyrtal/Yatzy", f"dist_categories_kinds_{ts}.png"),
+        ([10,11,12,13], "Två Par/Stegar/Kåk", f"dist_categories_others_{ts}.png")
     ]
 
     for indices, title, fname in groups:
@@ -642,8 +642,8 @@ def _plot_category_likelihoods(stats_roll1: np.ndarray, stats_roll2: np.ndarray,
         plt.bar(x + width, probs3[indices], width=width, label='Roll 3', color='#C44E52')
 
         plt.xticks(x, labels, rotation=20, ha='right')
-        plt.ylabel('Percentage Chance (%)')
-        plt.title(f"Likelihood to Achieve Categories — {title}")
+        plt.ylabel('Procent chans (%)')
+        plt.title(f"Sannolikhet att uppfylla kategorier — {title}")
         plt.legend()
         plt.tight_layout()
         plt.savefig(out_dir / fname, dpi=200)
@@ -740,7 +740,7 @@ def run_suite(args: argparse.Namespace) -> None:
             np.arange(SCORE_BINS_SIZE),
             score_bins,
             out_dir / f"dist_scores_{ts}.png",
-            f"Score Distribution (n={args.n:,})"
+            f"Poängfördelning (n={args.n:,})"
         )
         _plot_group_distributions(
             np.arange(SCORE_BINS_SIZE),
@@ -847,7 +847,7 @@ def run_suite(args: argparse.Namespace) -> None:
         print("Generating deviation plot...")
         plt.figure(figsize=(12, 8))
         for cat in CATEGORY_NAMES:
-            if cat == "Chance":
+            if cat == "Chans":
                 continue  # Skip Chance as it's all zeros
             deviations = []
             for step in steps:
@@ -857,10 +857,10 @@ def run_suite(args: argparse.Namespace) -> None:
             plt.plot(steps, deviations, marker='o', label=cat)
 
         plt.xscale('log')
-        plt.xlabel('Simulation Size')
-        plt.ylabel('Average Deviation (%)')
+        plt.xlabel('Simulationsstorlek (log-skala)')
+        plt.ylabel('Snittavvikelse (%) (log-skala)')
         plt.yscale('log')
-        plt.title('Deviation Between Expected and Observed Probabilities vs Simulation Size')
+        plt.title('Fördelning mellan förväntade och uppmätta sannolikheter mot Simulationsstorlek')
         plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         plt.grid(True, which='both', linestyle='--', linewidth=0.5)
         plt.tight_layout()
