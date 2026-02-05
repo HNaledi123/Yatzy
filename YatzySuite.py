@@ -35,8 +35,8 @@ from numba import njit
 
 CATEGORY_NAMES = [
     "Ettor", "Tvåor", "Treor", "Fyror", "Femmor", "Sexor",
-    "Ett Par", "Tretal", "Fyrtal", "Yatzy",
-    "Två Par", "Liten Stege", "Stor Stege", "Kåk", "Chans"
+    "Ett par", "Tretal", "Fyrtal", "Yatzy",
+    "Två par", "Liten stege", "Stor stege", "Kåk", "Chans"
 ]
 
 NUM_CATEGORIES = 15
@@ -55,15 +55,15 @@ EXPECTED_PROBS = np.array([
     4651 / ROLL_STATE_COUNT,    # Fyror
     4651 / ROLL_STATE_COUNT,    # Femmor
     4651 / ROLL_STATE_COUNT,    # Sexor
-    7056 / ROLL_STATE_COUNT,    # One Pair
-    1656 / ROLL_STATE_COUNT,    # Three of a Kind
-    156  / ROLL_STATE_COUNT,    # Four of a Kind
+    7056 / ROLL_STATE_COUNT,    # Ett par
+    1656 / ROLL_STATE_COUNT,    # Tretal
+    156  / ROLL_STATE_COUNT,    # Fyrtal
     6    / ROLL_STATE_COUNT,    # Yatzy
-    2100 / ROLL_STATE_COUNT,    # Two Pairs
-    120  / ROLL_STATE_COUNT,    # Small Straight
-    120  / ROLL_STATE_COUNT,    # Large Straight
-    300  / ROLL_STATE_COUNT,    # Full House
-    1.0                         # Chance
+    2100 / ROLL_STATE_COUNT,    # Två par
+    120  / ROLL_STATE_COUNT,    # Liten stege
+    120  / ROLL_STATE_COUNT,    # Stor stege
+    300  / ROLL_STATE_COUNT,    # Kåk
+    1.0                         # Chans
 ])
 
 # --- LOOKUP TABLE GENERATION ---
@@ -112,7 +112,7 @@ def _build_lookup_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarr
         dice_array = np.array(dice, dtype=np.int8)
         counts = np.bincount(dice_array, minlength=7) # Counts[0] unused
 
-        # Upper Section (Ettor through Sexor)
+        # Upper Section (Ettor-Sexor)
         for face in range(1, 7):
             scores[index, face-1] = counts[face] * face
             if counts[face] > 0: satisfaction_mask[index, face-1] = 1
@@ -421,7 +421,6 @@ def run_simulation_parallel(
 
             for f in done:
                 try:
-                    # Retrieve and aggregate results immediately
                     (total_score, score_bins, ny_nb, ny_yb, yy_nb, yy_yb, s0, s1, s2) = f.result()
                     agg_total_score += total_score
                     agg_score_bins += score_bins
@@ -616,8 +615,7 @@ def _plot_category_likelihoods(stats_roll1: np.ndarray, stats_roll2: np.ndarray,
     requested groupings: Upper (Ettor-Sexor), N-of-a-kind + Yatzy, and
     Pairs/Straights/Full House.
     """
-    total_rolls = int((stats_roll1.sum()))  # this is total rolls for roll1 (should equal n*15)
-    # Avoid division by zero
+    total_rolls = int((stats_roll1.sum()))
     if total_rolls == 0:
         return
 
@@ -664,16 +662,13 @@ def run_suite(args: argparse.Namespace) -> None:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
-    seed_scheme = "base_seed + worker_id"
     environment = _get_environment_snapshot()
-    # If user omitted --seed, choose a random base seed for nondeterministic runs
     if args.seed is None:
         base_seed = random.randrange(2**31)
         print(f"Using random base seed: {base_seed}")
     else:
         base_seed = args.seed
 
-    # Determine effective threads and (later) batch_size for logging and usage
     effective_threads = args.threads or (os.cpu_count() or 4)
 
     # Mode 1: Distribution Analysis
@@ -687,7 +682,7 @@ def run_suite(args: argparse.Namespace) -> None:
         else:
             target_chunks = effective_threads * 4
             effective_batch_size = max(1000, args.n // target_chunks)
-            effective_batch_size = min(effective_batch_size, 100_000)
+            effective_batch_size = min(effective_batch_size, 1_000_000)
 
         total_score, score_bins, bins_ny_nb, bins_ny_yb, bins_yy_nb, bins_yy_yb, stats_roll1, stats_roll2, stats_roll3 = run_simulation_parallel(
             args.n,
@@ -710,7 +705,6 @@ def run_suite(args: argparse.Namespace) -> None:
             w.writerow(["Category", "Roll1_Hits", "Roll1_Prob", "Roll2_Hits", "Roll2_Prob", "Roll3_Hits", "Roll3_Prob"])
             for i, cat in enumerate(CATEGORY_NAMES):
                 w.writerow([cat, stats_roll1[i], stats_roll1[i]/tot_r, stats_roll2[i], stats_roll2[i]/tot_r, stats_roll3[i], stats_roll3[i]/tot_r])
-        # Create bar charts showing percentage chance per category for each roll
         try:
             _plot_category_likelihoods(stats_roll1, stats_roll2, stats_roll3, out_dir, ts)
         except Exception:
@@ -755,7 +749,6 @@ def run_suite(args: argparse.Namespace) -> None:
             "numpy_version": np.__version__,
             "numba_version": __import__("numba").__version__,
             "seed": base_seed,
-            "seed_scheme": seed_scheme,
             "threads": effective_threads,
             "batch_size": effective_batch_size,
             "n_games": args.n,
@@ -775,7 +768,6 @@ def run_suite(args: argparse.Namespace) -> None:
 
     # Mode 2: Probability Deviation Study
     if args.study:
-        # reuse effective_threads computed earlier
         steps = [int(x) for x in args.study.split(",")]
         reps = args.reps
         print(f"\n=== MODE 2: DEVIATION STUDY ({len(steps)} steps, {reps} reps/step) ===")
@@ -848,7 +840,7 @@ def run_suite(args: argparse.Namespace) -> None:
         plt.figure(figsize=(12, 8))
         for cat in CATEGORY_NAMES:
             if cat == "Chans":
-                continue  # Skip Chance as it's all zeros
+                continue
             deviations = []
             for step in steps:
                 devs = summary_data[cat][step]
@@ -865,7 +857,7 @@ def run_suite(args: argparse.Namespace) -> None:
         plt.grid(True, which='both', linestyle='--', linewidth=0.5)
         plt.tight_layout()
         plt.savefig(out_dir / f"study_deviation_plot_{ts}.png", dpi=300, bbox_inches='tight')
-        plt.close()  # Close the figure to free memory
+        plt.close()
         print(f"Plot saved as {out_dir}/study_deviation_plot_{ts}.png")
 
         elapsed_study = time.time() - start_t_study
@@ -879,7 +871,6 @@ def run_suite(args: argparse.Namespace) -> None:
             "numpy_version": np.__version__,
             "numba_version": __import__("numba").__version__,
             "seed": base_seed,
-            "seed_scheme": seed_scheme,
             "threads": effective_threads,
             "batch_size": args.batch_size if args.batch_size else None,
             "n_games": total_games,
